@@ -314,7 +314,7 @@ if args.dataset == 'speech':
 
 datatag = f'{args.dataset}'
 if args.dataset == 'imagenet':
-    datatag += f'{args.nclass}'
+    datatag += f'{args.spec}'
     if args.dseed != 0:
         datatag += f'-seed{args.dseed}'
 """
@@ -423,22 +423,23 @@ args.datatag = datatag
 Evaluation setting
 """
 # Setting evaluation training epochs
-if args.ipc > 0:
-    if args.dataset == 'imagenet':
-        if args.decode_type == 'bound':
-            args.epochs = ipc_epoch(args.ipc, args.factor, args.nclass, bound=args.batch_syn_max)
-        else:
-            args.epochs = ipc_epoch(args.ipc, args.factor, args.nclass)
-        args.epoch_print_freq = args.epochs // 100
-    else:
-        args.epochs = 1000
-        args.epoch_print_freq = args.epochs
-else:
-    args.epoch_print_freq = 1
+# if args.ipc > 0:
+#     if args.dataset == 'imagenet':
+#         if args.decode_type == 'bound':
+#             args.epochs = ipc_epoch(args.ipc, args.factor, args.nclass, bound=args.batch_syn_max)
+#         else:
+#             args.epochs = ipc_epoch(args.ipc, args.factor, args.nclass)
+#         args.epoch_print_freq = args.epochs // 100
+#     else:
+#         args.epochs = 1000
+#         args.epoch_print_freq = args.epochs
+# else:
+args.epoch_print_freq = 1
 
 # Setting augmentation
-if args.mixup == 'cut':
-    args.dsa_strategy = remove_aug(args.dsa_strategy, 'cutout')
+# if args.mixup == 'cut':
+#     args.dsa_strategy = remove_aug(args.dsa_strategy, 'cutout')
+    
 if args.dsa:
     args.augment = False
     print("DSA strategy: ", args.dsa_strategy)

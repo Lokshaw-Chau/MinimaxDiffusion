@@ -60,7 +60,7 @@ class ImageFolder(datasets.DatasetFolder):
                  phase=0,
                  slct_type='random',
                  ipc=-1,
-                 seed=-1,
+                 seed=0,
                  spec='none',
                  return_origin=False):
         self.extensions = IMG_EXTENSIONS if is_valid_file is None else None
@@ -106,11 +106,11 @@ class ImageFolder(datasets.DatasetFolder):
         cls_to = nclass * (phase + 1)
         if seed == 0:
             if self.spec == 'woof':
-                file_list = './misc/class_woof.txt'
+                file_list = '/root/workspace/MinimaxDiffusion/misc/class_woof.txt'
             elif self.spec == 'nette':
-                file_list = './misc/class_nette.txt'
+                file_list = '/root/workspace/MinimaxDiffusion/misc/class_nette.txt'
             else:
-                file_list = './misc/class100.txt'
+                file_list = '/root/workspace/MinimaxDiffusion/misc/class100.txt'
             with open(file_list, 'r') as f:
                 class_name = f.readlines()
             for c in class_name:
@@ -323,6 +323,7 @@ def transform_imagenet(size=-1,
                                       [-0.5808, -0.0045, -0.8140],
                                       [-0.5836, -0.6948, 0.4203],
                                   ])
+        # transforms.RandAugment()
         aug = [transforms.RandomHorizontalFlip(), jittering, lighting]
 
         if rrc and size >= 0:

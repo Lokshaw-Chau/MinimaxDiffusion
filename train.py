@@ -64,6 +64,23 @@ def define_model(args, nclass, logger=None, size=None):
                            net_width=width,
                            channel=args.nch,
                            im_size=(args.size, args.size))
+    # elif args.net_type == "resnet18":
+    #     model = models.__dict__[args.net_type](pretrained=True, num_classes=1000)
+    #     model.conv1 = nn.Conv2d(
+    #             3, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False
+    #         )
+    #     model.maxpool = nn.Identity()
+    #     model.fc = nn.Linear(model.fc.in_features,10)
+
+    # elif args.net_type == "mobilenet_v2":
+    #     model = models.__dict__[args.net_type](pretrained=True, num_classes=1000)
+    #     model.classifier[1] = nn.Linear(model.classifier[1].in_features,10)
+    # elif args.net_type == "efficientnet_b0":
+    #     model = models.__dict__[args.net_type](pretrained=True, num_classes=1000)
+    #     model.classifier[1] = nn.Linear(model.classifier[1].in_features,10)
+    # elif args.net_type == "shufflenet_v2_x0_5":
+    #     model = models.__dict__[args.net_type](pretrained=True, num_classes=1000)
+    #     model.fc = nn.Linear(model.fc.in_features, 10)
     else:
         raise Exception('unknown network architecture: {}'.format(args.net_type))
 
@@ -93,7 +110,7 @@ def main(args, logger, repeat=1):
         best_acc, acc = train(args, model, train_loader, val_loader, plotter, logger)
         best_acc_l.append(best_acc)
         acc_l.append(acc)
-
+    
     logger(f'\n(Repeat {repeat}) Best, last acc: {np.mean(best_acc_l):.1f} {np.std(best_acc_l):.1f}')
 
 

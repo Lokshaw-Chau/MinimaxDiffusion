@@ -132,3 +132,8 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+
+logs/
+squeeze/squeeze_wo_ema/
+relabel/
+**/wandb/
