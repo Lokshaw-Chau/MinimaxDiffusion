@@ -90,7 +90,7 @@ parser.add_argument('--data_dir',
 parser.add_argument('--imagenet_dir', nargs='+', default=['/ssd_data/imagenet/'])
 parser.add_argument('--nclass', default=10, type=int, help='number of classes in trianing dataset')
 parser.add_argument('--dseed', default=0, type=int, help='seed for class sampling')
-parser.add_argument('--size', default=224, type=int, help='spatial size of image')
+parser.add_argument('--size', default=256, type=int, help='spatial size of image')
 parser.add_argument('--phase', default=-1, type=int, help='index for multi-processing')
 parser.add_argument('--nclass_sub', default=-1, type=int, help='number of classes for each process')
 parser.add_argument('-l',
@@ -144,7 +144,7 @@ parser.add_argument('--verbose',
                     dest='verbose',
                     action='store_true',
                     help='to print the status at every iteration')
-parser.add_argument('-j', '--workers', default=8, type=int, help='number of data loading workers')
+parser.add_argument('-j', '--workers', default=32, type=int, help='number of data loading workers')
 parser.add_argument('--save_ckpt', type=str2bool, default=False)
 parser.add_argument('--tag', default='', type=str, help='name of experiment')
 parser.add_argument('--test', action='store_true', help='for debugging, do not save results')
@@ -248,8 +248,10 @@ parser.add_argument('--same_compute',
                     default=False,
                     help='match evaluation training steps for IDC')
 parser.add_argument('--name', type=str, default='', help='name of the test data folder')
+parser.add_argument('--ckpt-dir', type=str, default='', help='name of the test data folder')
 parser.add_argument('--spec', type=str, default='none')
-
+parser.add_argument('--save-interval', type=int, default=1)
+parser.add_argument('--start', type=int, default=0)
 parser.set_defaults(bottleneck=True)
 parser.set_defaults(verbose=False)
 args = parser.parse_args()
@@ -423,23 +425,22 @@ args.datatag = datatag
 Evaluation setting
 """
 # Setting evaluation training epochs
-# if args.ipc > 0:
-#     if args.dataset == 'imagenet':
-#         if args.decode_type == 'bound':
-#             args.epochs = ipc_epoch(args.ipc, args.factor, args.nclass, bound=args.batch_syn_max)
-#         else:
-#             args.epochs = ipc_epoch(args.ipc, args.factor, args.nclass)
-#         args.epoch_print_freq = args.epochs // 100
-#     else:
-#         args.epochs = 1000
-#         args.epoch_print_freq = args.epochs
-# else:
-args.epoch_print_freq = 1
+if args.ipc > 0:
+    if args.dataset == 'imagenet':
+        if args.decode_type == 'bound':
+            args.epochs = ipc_epoch(args.ipc, args.factor, args.nclass, bound=args.batch_syn_max)
+        else:
+            args.epochs = ipc_epoch(args.ipc, args.factor, args.nclass)
+        args.epoch_print_freq = args.epochs // 100
+    else:
+        args.epochs = 1000
+        args.epoch_print_freq = args.epochs
+else:
+    args.epoch_print_freq = 1
 
 # Setting augmentation
-# if args.mixup == 'cut':
-#     args.dsa_strategy = remove_aug(args.dsa_strategy, 'cutout')
-    
+if args.mixup == 'cut':
+    args.dsa_strategy = remove_aug(args.dsa_strategy, 'cutout')
 if args.dsa:
     args.augment = False
     print("DSA strategy: ", args.dsa_strategy)

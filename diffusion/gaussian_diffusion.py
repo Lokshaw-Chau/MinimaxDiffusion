@@ -9,9 +9,11 @@ import math
 import numpy as np
 import torch as th
 import enum
-
+import torch
+import copy
 from .diffusion_utils import discretized_gaussian_log_likelihood, normal_kl
-
+import time
+import gc
 
 def mean_flat(tensor):
     """
@@ -29,6 +31,12 @@ class ModelMeanType(enum.Enum):
     START_X = enum.auto()  # the model predicts x_0
     EPSILON = enum.auto()  # the model predicts epsilon
 
+def cosine_similarity(ta, tb):
+    bs1, bs2 = ta.shape[0], tb.shape[0]
+    frac_up = torch.matmul(ta, tb.T)
+    frac_down = torch.norm(ta, dim=-1).view(bs1, 1).repeat(1, bs2) * \
+                torch.norm(tb, dim=-1).view(1, bs2).repeat(bs1, 1)
+    return frac_up / frac_down
 
 class ModelVarType(enum.Enum):
     """
@@ -273,6 +281,8 @@ class GaussianDiffusion:
         """
         if model_kwargs is None:
             model_kwargs = {}
+        else:
+            model_kwargs = dict(y=model_kwargs['y'], cfg_scale=model_kwargs['cfg_scale'])
 
         B, C = x.shape[:2]
         assert t.shape == (B,)
@@ -313,7 +323,8 @@ class GaussianDiffusion:
             if clip_denoised:
                 return x.clamp(-1, 1)
             return x
-
+        
+        # some models' output is already x_start? but some are the score?
         if self.model_mean_type == ModelMeanType.START_X:
             pred_xstart = process_xstart(model_output)
         else:
@@ -329,6 +340,9 @@ class GaussianDiffusion:
             "log_variance": model_log_variance,
             "pred_xstart": pred_xstart,
             "extra": extra,
+            # "l2": 0.005 * ((model_output[0] * model_output[0]).mean().sqrt() * 
+            # self.sqrt_one_minus_alphas_cumprod[t[0]] / self.sqrt_alphas_cumprod[t[0]] * self.posterior_mean_coef1[t[0]]).item(),
+            "l2": 0.0015 * (model_output[0].data * model_output[0].data).mean().sqrt()
         }
 
     def _predict_xstart_from_eps(self, x_t, t, eps):
@@ -373,6 +387,54 @@ class GaussianDiffusion:
         out["mean"], _, _ = self.q_posterior_mean_variance(x_start=out["pred_xstart"], x_t=x, t=t)
         return out
 
+    # ori
+    # def p_sample(
+    #     self,
+    #     model,
+    #     x,
+    #     t,
+    #     clip_denoised=True,
+    #     denoised_fn=None,
+    #     cond_fn=None,
+    #     model_kwargs=None,
+    # ):
+    #     """
+    #     Sample x_{t-1} from the model at the given timestep.
+    #     :param model: the model to sample from.
+    #     :param x: the current tensor at x_{t-1}.
+    #     :param t: the value of t, starting at 0 for the first diffusion step.
+    #     :param clip_denoised: if True, clip the x_start prediction to [-1, 1].
+    #     :param denoised_fn: if not None, a function which applies to the
+    #         x_start prediction before it is used to sample.
+    #     :param cond_fn: if not None, this is a gradient function that acts
+    #                     similarly to the model.
+    #     :param model_kwargs: if not None, a dict of extra keyword arguments to
+    #         pass to the model. This can be used for conditioning.
+    #     :return: a dict containing the following keys:
+    #              - 'sample': a random sample from the model.
+    #              - 'pred_xstart': a prediction of x_0.
+    #     """
+    #     out = self.p_mean_variance(
+    #         model,
+    #         x,
+    #         t,
+    #         clip_denoised=clip_denoised,
+    #         denoised_fn=denoised_fn,
+    #         model_kwargs=model_kwargs,
+    #     ) # x_{t-1}
+    #     noise = th.randn_like(x)
+    #     nonzero_mask = (
+    #         (t != 0).float().view(-1, *([1] * (len(x.shape) - 1)))
+    #     )  # no noise when t == 0
+    #     if cond_fn is not None:
+    #         out["mean"] = self.condition_mean(cond_fn, out, x, t, model_kwargs=model_kwargs)
+    #     sample = out["mean"] + nonzero_mask * th.exp(0.5 * out["log_variance"]) * noise
+    #     return {"sample": sample, "pred_xstart": out["pred_xstart"]}
+    
+    # mc modified
+    def cal_new_mean(self,):
+        pass
+
     def p_sample(
         self,
         model,
@@ -399,6 +461,9 @@ class GaussianDiffusion:
                  - 'sample': a random sample from the model.
                  - 'pred_xstart': a prediction of x_0.
         """
+        x = copy.deepcopy(x.data).requires_grad_(True)
+        # print('x shape',x.shape)
+        # print('cur t',t[0])
         out = self.p_mean_variance(
             model,
             x,
@@ -406,15 +471,104 @@ class GaussianDiffusion:
             clip_denoised=clip_denoised,
             denoised_fn=denoised_fn,
             model_kwargs=model_kwargs,
-        )
-        noise = th.randn_like(x)
+        ) # x_{t-1}
+        noise = th.randn_like(x.data)
         nonzero_mask = (
             (t != 0).float().view(-1, *([1] * (len(x.shape) - 1)))
         )  # no noise when t == 0
         if cond_fn is not None:
             out["mean"] = self.condition_mean(cond_fn, out, x, t, model_kwargs=model_kwargs)
-        sample = out["mean"] + nonzero_mask * th.exp(0.5 * out["log_variance"]) * noise
+        if model_kwargs['gen_type'] == 'igd':
+            if t[0] >= model_kwargs['low'] and t[0] <= model_kwargs['high']:
+                instep = True
+            else:
+                instep = False
+
+        if model_kwargs['gen_type'] == 'igd' and instep:
+            # not random real draging but gm only
+                # print('Ture')
+                sample = out["mean"].detach().data + nonzero_mask * th.exp(0.5 * out["log_variance"]) * noise 
+                used_sample0, _ = sample.chunk(2, dim=0)
+                x_t, _ = x.data.detach().chunk(2,dim=0)
+                if len(model_kwargs['pseudo_memory_c'])>0:
+                    neg_embeddings = torch.cat(model_kwargs['pseudo_memory_c']).flatten(start_dim=1)
+                    # TODO: calculate MMD in a batch
+                    neg_idx = cosine_similarity(
+                    x_t.flatten(start_dim=1), neg_embeddings
+                    )[0].argmax().item()
+                    # print('pos_idx and ne
+                    x_t = x_t.requires_grad_(True)
+                    with torch.enable_grad():
+                        cos_sim = cos_loss(x_t.flatten(),model_kwargs['pseudo_memory_c'][neg_idx].flatten())
+                        cos_guide = torch.autograd.grad(cos_sim, x_t)[0].data.detach()
+                    # print('cos guide:',torch.mean(cos_guide))
+                    used_sample = used_sample0.data - model_kwargs['neg_e'] * cos_guide
+                else:
+                    used_sample = used_sample0.data
+                
+                # adding a gradient guidance
+                prdict_start = out["pred_xstart"]
+                # sqrt_alpha_on_max = np.sqrt(self.alphas_cumprod[t[0]]/self.alphas_cumprod.max())
+                with torch.enable_grad():
+                    # used_sample = copy.deepcopy(used_sample.data).requires_grad_(True)
+                    pseudo_imgs = model_kwargs['gm_resource'][0].decode(prdict_start / 0.18215).sample.requires_grad_(True)
+                    gm_guide = torch.zeros_like(used_sample.data)
+                    pseudo_target = torch.tensor([np.ones(len(pseudo_imgs)) * model_kwargs['gm_resource'][4]], dtype=torch.long, requires_grad=False, device='cuda').view(-1)
+                    for i,ckpt in enumerate(model_kwargs['gm_resource'][2]):
+                        cur_params = torch.cat([p.data.to('cuda').reshape(-1) for p in ckpt], 0).requires_grad_(True)
+                        real_grad = model_kwargs['gm_resource'][3][i].to('cuda')
+                        pseudo_pred = model_kwargs['gm_resource'][1](pseudo_imgs, flat_param=cur_params)
+                        pseudo_loss = model_kwargs['gm_resource'][5](pseudo_pred, pseudo_target)
+                        # pseudo_grad = torch.autograd.grad(pseudo_loss, cur_params,create_graph=True, retain_graph=True)[0]
+                        pseudo_grad = torch.autograd.grad(pseudo_loss, cur_params, create_graph=True)[0]
+
+                        ckpt_gm_loss = gm_loss(pseudo_grad, real_grad) / len(model_kwargs['gm_resource'][2])
+                        # gm_guide += torch.autograd.grad(ckpt_gm_loss, x,create_graph=True, retain_graph=True)[0][0]
+                        if i < len(model_kwargs['gm_resource'][2])-1:
+                            gm_guide += torch.autograd.grad(ckpt_gm_loss, x, retain_graph=True)[0][0].data
+                        else:
+                            gm_guide += torch.autograd.grad(ckpt_gm_loss, x)[0][0].data
+     
+                # rho_t = out["l2"] / (gm_guide * gm_guide).mean().sqrt().item()    
+                rho_t =   (out["l2"]/(gm_guide.data * gm_guide.data).mean().sqrt()) * self.sqrt_one_minus_alphas_cumprod[t[0]].item()
+                # TODO: add representation guidance
+
+                used_sample1 = used_sample - rho_t * model_kwargs['gm_resource'][-1]  * gm_guide 
+                del gm_guide, cur_params, pseudo_imgs, pseudo_grad, used_sample, x
+   
+                gc.collect()
+                torch.cuda.empty_cache()
+                
+                if model_kwargs['gm_resource'][6] > 1:
+                    # print('repeat:',model_kwargs['gm_resource'][6])
+                    model_kwargs['gm_resource'][6] -= 1
+
+                    epsilon2 = torch.randn_like(used_sample1)
+                    beta_bar = _extract_into_tensor(self.betas, t[0], used_sample1.shape)
+
+                    sample[0,:,:,:] = th.sqrt(1 - beta_bar) * used_sample1 + th.sqrt(beta_bar) * epsilon2
+                    out = self.p_sample(
+                        model,
+                        sample.detach().data,
+                        t,
+                        clip_denoised=clip_denoised,
+                        denoised_fn=denoised_fn,
+                        cond_fn=cond_fn,
+                        model_kwargs=model_kwargs,)
+                    sample = out['sample']
+                else:
+                    sample[0,:,:,:] = used_sample1
+                    # reset the count for recursion
+                    model_kwargs['gm_resource'][6] = model_kwargs['gm_resource'][7]
+
+        # except:
+        else:
+            # print('true1')
+            sample = out["mean"] + nonzero_mask * th.exp(0.5 * out["log_variance"]) * noise
         return {"sample": sample, "pred_xstart": out["pred_xstart"]}
+
+
+
 
     def p_sample_loop(
         self,
@@ -497,18 +651,18 @@ class GaussianDiffusion:
 
         for i in indices:
             t = th.tensor([i] * shape[0], device=device)
-            with th.no_grad():
-                out = self.p_sample(
-                    model,
-                    img,
-                    t,
-                    clip_denoised=clip_denoised,
-                    denoised_fn=denoised_fn,
-                    cond_fn=cond_fn,
-                    model_kwargs=model_kwargs,
-                )
-                yield out
-                img = out["sample"]
+            # with th.no_grad():
+            out = self.p_sample(
+                model,
+                img,
+                t,
+                clip_denoised=clip_denoised,
+                denoised_fn=denoised_fn,
+                cond_fn=cond_fn,
+                model_kwargs=model_kwargs,
+            )
+            yield out
+            img = out["sample"]
 
     def ddim_sample(
         self,
@@ -872,3 +1026,11 @@ def _extract_into_tensor(arr, timesteps, broadcast_shape):
     while len(res.shape) < len(broadcast_shape):
         res = res[..., None]
     return res + th.zeros(broadcast_shape, device=timesteps.device)
+
+def cos_loss(pg, rg):
+    sim = torch.sum(pg * rg, dim=-1) / (torch.norm(pg, dim=-1) * torch.norm(rg, dim=-1) + 0.000001)
+    return sim
+
+def gm_loss(pg, rg):
+    inv_gm_dist = torch.sum(1 - torch.sum(pg * rg, dim=-1) / (torch.norm(pg, dim=-1) * torch.norm(rg, dim=-1) + 0.000001))
+    return inv_gm_dist
