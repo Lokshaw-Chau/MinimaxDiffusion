@@ -24,7 +24,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import sys
 sys.path.append('../')
-from validation.utils import (
+from EDC_validation.utils import (
     ShufflePatches,
     mix_aug,
     AverageMeter,
@@ -376,7 +376,7 @@ def validate(model, args, epoch=None):
 
 if __name__ == "__main__":
     from misc.utils import Logger
-    from validation.valid_argument import args
+    from EDC_validation.valid_argument import args
 
     logger = Logger(args.log_path)
     main(args, logger, args.repeat)

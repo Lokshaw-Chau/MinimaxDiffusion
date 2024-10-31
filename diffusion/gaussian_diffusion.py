@@ -14,6 +14,7 @@ import copy
 from .diffusion_utils import discretized_gaussian_log_likelihood, normal_kl
 import time
 import gc
+import wandb
 
 def mean_flat(tensor):
     """
@@ -37,6 +38,16 @@ def cosine_similarity(ta, tb):
     frac_down = torch.norm(ta, dim=-1).view(bs1, 1).repeat(1, bs2) * \
                 torch.norm(tb, dim=-1).view(1, bs2).repeat(bs1, 1)
     return frac_up / frac_down
+
+def l2_distance(ta, tb):
+    # calculate the l2 distance between ta and tb pair wise
+    bs1, bs2 = ta.shape[0], tb.shape[0]
+    ta = ta.view(bs1, -1)
+    tb = tb.view(bs2, -1)
+    ta = ta.unsqueeze(1).expand(bs1, bs2, -1)
+    tb = tb.unsqueeze(0).expand(bs1, bs2, -1)
+    return torch.norm(ta - tb, dim=-1)
+
 
 class ModelVarType(enum.Enum):
     """
@@ -478,7 +489,7 @@ class GaussianDiffusion:
         )  # no noise when t == 0
         if cond_fn is not None:
             out["mean"] = self.condition_mean(cond_fn, out, x, t, model_kwargs=model_kwargs)
-        if model_kwargs['gen_type'] == 'igd':
+        if model_kwargs['gen_type'] == 'igd' or model_kwargs['gen_type'] == 'rgd':
             if t[0] >= model_kwargs['low'] and t[0] <= model_kwargs['high']:
                 instep = True
             else:
@@ -486,81 +497,190 @@ class GaussianDiffusion:
 
         if model_kwargs['gen_type'] == 'igd' and instep:
             # not random real draging but gm only
-                # print('Ture')
-                sample = out["mean"].detach().data + nonzero_mask * th.exp(0.5 * out["log_variance"]) * noise 
-                used_sample0, _ = sample.chunk(2, dim=0)
-                x_t, _ = x.data.detach().chunk(2,dim=0)
-                if len(model_kwargs['pseudo_memory_c'])>0:
-                    neg_embeddings = torch.cat(model_kwargs['pseudo_memory_c']).flatten(start_dim=1)
-                    # TODO: calculate MMD in a batch
-                    neg_idx = cosine_similarity(
-                    x_t.flatten(start_dim=1), neg_embeddings
-                    )[0].argmax().item()
-                    # print('pos_idx and ne
-                    x_t = x_t.requires_grad_(True)
-                    with torch.enable_grad():
-                        cos_sim = cos_loss(x_t.flatten(),model_kwargs['pseudo_memory_c'][neg_idx].flatten())
-                        cos_guide = torch.autograd.grad(cos_sim, x_t)[0].data.detach()
-                    # print('cos guide:',torch.mean(cos_guide))
-                    used_sample = used_sample0.data - model_kwargs['neg_e'] * cos_guide
-                else:
-                    used_sample = used_sample0.data
-                
-                # adding a gradient guidance
-                prdict_start = out["pred_xstart"]
-                # sqrt_alpha_on_max = np.sqrt(self.alphas_cumprod[t[0]]/self.alphas_cumprod.max())
+            # print('Ture')
+            sample = out["mean"].detach().data + nonzero_mask * th.exp(0.5 * out["log_variance"]) * noise 
+            used_sample0, _ = sample.chunk(2, dim=0)
+            x_t, _ = x.data.detach().chunk(2,dim=0)
+            if len(model_kwargs['pseudo_memory_c'])>0:
+                neg_embeddings = torch.cat(model_kwargs['pseudo_memory_c']).flatten(start_dim=1)
+                neg_idx = cosine_similarity(
+                x_t.flatten(start_dim=1), neg_embeddings
+                )[0].argmax().item()
+                # print('pos_idx and ne
+                x_t = x_t.requires_grad_(True)
                 with torch.enable_grad():
-                    # used_sample = copy.deepcopy(used_sample.data).requires_grad_(True)
-                    pseudo_imgs = model_kwargs['gm_resource'][0].decode(prdict_start / 0.18215).sample.requires_grad_(True)
-                    gm_guide = torch.zeros_like(used_sample.data)
-                    pseudo_target = torch.tensor([np.ones(len(pseudo_imgs)) * model_kwargs['gm_resource'][4]], dtype=torch.long, requires_grad=False, device='cuda').view(-1)
-                    for i,ckpt in enumerate(model_kwargs['gm_resource'][2]):
-                        cur_params = torch.cat([p.data.to('cuda').reshape(-1) for p in ckpt], 0).requires_grad_(True)
-                        real_grad = model_kwargs['gm_resource'][3][i].to('cuda')
-                        pseudo_pred = model_kwargs['gm_resource'][1](pseudo_imgs, flat_param=cur_params)
-                        pseudo_loss = model_kwargs['gm_resource'][5](pseudo_pred, pseudo_target)
-                        # pseudo_grad = torch.autograd.grad(pseudo_loss, cur_params,create_graph=True, retain_graph=True)[0]
-                        pseudo_grad = torch.autograd.grad(pseudo_loss, cur_params, create_graph=True)[0]
+                    cos_sim = cos_loss(x_t.flatten(),model_kwargs['pseudo_memory_c'][neg_idx].flatten())
+                    cos_guide = torch.autograd.grad(cos_sim, x_t)[0].data.detach()
+                # print('cos guide:',torch.mean(cos_guide))
+                used_sample = used_sample0.data - model_kwargs['neg_e'] * cos_guide
+            else:
+                used_sample = used_sample0.data
+            
+            # adding a gradient guidance
+            prdict_start = out["pred_xstart"]
+            # sqrt_alpha_on_max = np.sqrt(self.alphas_cumprod[t[0]]/self.alphas_cumprod.max())
+            with torch.enable_grad():
+                # used_sample = copy.deepcopy(used_sample.data).requires_grad_(True)
+                pseudo_imgs = model_kwargs['gm_resource'][0].decode(prdict_start / 0.18215).sample.requires_grad_(True)
+                gm_guide = torch.zeros_like(used_sample.data)
+                pseudo_target = torch.tensor([np.ones(len(pseudo_imgs)) * model_kwargs['gm_resource'][4]], dtype=torch.long, requires_grad=False, device='cuda').view(-1)
+                for i,ckpt in enumerate(model_kwargs['gm_resource'][2][:-1]):
+                    cur_params = torch.cat([p.data.to('cuda').reshape(-1) for p in ckpt], 0).requires_grad_(True)
+                    real_grad = model_kwargs['gm_resource'][3][i].to('cuda')
+                    pseudo_pred = model_kwargs['gm_resource'][1](pseudo_imgs, flat_param=cur_params)
+                    pseudo_loss = model_kwargs['gm_resource'][5](pseudo_pred, pseudo_target)
+                    # pseudo_grad = torch.autograd.grad(pseudo_loss, cur_params,create_graph=True, retain_graph=True)[0]
+                    pseudo_grad = torch.autograd.grad(pseudo_loss, cur_params, create_graph=True)[0]
 
-                        ckpt_gm_loss = gm_loss(pseudo_grad, real_grad) / len(model_kwargs['gm_resource'][2])
-                        # gm_guide += torch.autograd.grad(ckpt_gm_loss, x,create_graph=True, retain_graph=True)[0][0]
-                        if i < len(model_kwargs['gm_resource'][2])-1:
-                            gm_guide += torch.autograd.grad(ckpt_gm_loss, x, retain_graph=True)[0][0].data
-                        else:
-                            gm_guide += torch.autograd.grad(ckpt_gm_loss, x)[0][0].data
+                    ckpt_gm_loss = gm_loss(pseudo_grad, real_grad) / len(model_kwargs['gm_resource'][2])
+                    # gm_guide += torch.autograd.grad(ckpt_gm_loss, x,create_graph=True, retain_graph=True)[0][0]
+                    if i < len(model_kwargs['gm_resource'][2])-1:
+                        gm_guide += torch.autograd.grad(ckpt_gm_loss, x, retain_graph=True)[0][0].data
+                    else:
+                        gm_guide += torch.autograd.grad(ckpt_gm_loss, x)[0][0].data
      
-                # rho_t = out["l2"] / (gm_guide * gm_guide).mean().sqrt().item()    
-                rho_t =   (out["l2"]/(gm_guide.data * gm_guide.data).mean().sqrt()) * self.sqrt_one_minus_alphas_cumprod[t[0]].item()
-                # TODO: add representation guidance
+            # rho_t = out["l2"] / (gm_guide * gm_guide).mean().sqrt().item()    
+            rho_t =   (out["l2"]/(gm_guide.data * gm_guide.data).mean().sqrt()) * self.sqrt_one_minus_alphas_cumprod[t[0]].item()
+            
+            used_sample1 = used_sample - rho_t * model_kwargs['gm_resource'][-2]  * gm_guide
+            
+            if len(model_kwargs['pseudo_memory_c'])>0:
+                wandb.log({'gm_guide':(rho_t * model_kwargs['gm_resource'][-2]  * gm_guide).mean().item(), 'latent_guide':(model_kwargs['neg_e'] * cos_guide).mean().item()})
+                # print('cos/gm ratio', ((model_kwargs['neg_e'] * cos_guide) / (rho_t * model_kwargs['gm_resource'][-2]  * gm_guide)).mean())
+            
+            del gm_guide, cur_params, pseudo_imgs, pseudo_grad, used_sample, x
 
-                used_sample1 = used_sample - rho_t * model_kwargs['gm_resource'][-1]  * gm_guide 
-                del gm_guide, cur_params, pseudo_imgs, pseudo_grad, used_sample, x
-   
-                gc.collect()
-                torch.cuda.empty_cache()
+            gc.collect()
+            torch.cuda.empty_cache()
+            
+            if model_kwargs['gm_resource'][6] > 1:
+                # print('repeat:',model_kwargs['gm_resource'][6])
+                model_kwargs['gm_resource'][6] -= 1
+
+                epsilon2 = torch.randn_like(used_sample1)
+                beta_bar = _extract_into_tensor(self.betas, t[0], used_sample1.shape)
+
+                sample[0,:,:,:] = th.sqrt(1 - beta_bar) * used_sample1 + th.sqrt(beta_bar) * epsilon2
+                out = self.p_sample(
+                    model,
+                    sample.detach().data,
+                    t,
+                    clip_denoised=clip_denoised,
+                    denoised_fn=denoised_fn,
+                    cond_fn=cond_fn,
+                    model_kwargs=model_kwargs,)
+                sample = out['sample']
+            else:
+                sample[0,:,:,:] = used_sample1
+                # reset the count for recursion
+                model_kwargs['gm_resource'][6] = model_kwargs['gm_resource'][7]
+
+        elif model_kwargs['gen_type'] == 'rgd' and instep:
+            sample = out["mean"].detach().data + nonzero_mask * th.exp(0.5 * out["log_variance"]) * noise 
+            used_sample0, _ = sample.chunk(2, dim=0)
+            x_t, _ = x.data.detach().chunk(2,dim=0)
+            # if len(model_kwargs['pseudo_memory_c'])>0:
+            #     neg_embeddings = torch.cat(model_kwargs['pseudo_memory_c']).flatten(start_dim=1)
+            #     # neg_idx = cosine_similarity(
+            #     # x_t.flatten(start_dim=1), neg_embeddings
+            #     # )[0].argmax().item()
+
+            #     params = model_kwargs['gm_resource'][2][-1]
+            #     _, feat = model_kwargs['gm_resource'][1](pseudo_imgs, flat_param=cur_params)
+            #     neg_idx = l2_distance(x_t.flatten(start_dim=1), neg_embeddings).argmin().item()
+            #     # print('pos_idx and ne
+            #     x_t = x_t.requires_grad_(True)
+            #     with torch.enable_grad():
+            #         cos_sim = cos_loss(x_t.flatten(),model_kwargs['pseudo_memory_c'][neg_idx].flatten())
+            #         cos_guide = torch.autograd.grad(cos_sim, x_t)[0].data.detach()
+            #     # print('cos guide:',torch.mean(cos_guide))
+            #     used_sample = used_sample0.data - model_kwargs['neg_e'] * cos_guide
+            # else:
+            used_sample = used_sample0.data
+            
+            # adding a gradient guidance
+            prdict_start = out["pred_xstart"]
+            # FIXME why forward uncondition generation at the same
+            # sqrt_alpha_on_max = np.sqrt(self.alphas_cumprod[t[0]]/self.alphas_cumprod.max())
+            with torch.enable_grad():
+                # used_sample = copy.deepcopy(used_sample.data).requires_grad_(True)
+                pseudo_imgs = model_kwargs['gm_resource'][0].decode(prdict_start / 0.18215).sample.requires_grad_(True)
+                gm_guide = torch.zeros_like(used_sample.data)
+                pseudo_target = torch.tensor([np.ones(len(pseudo_imgs)) * model_kwargs['gm_resource'][4]], dtype=torch.long, requires_grad=False, device='cuda').view(-1)
+                for i,ckpt in enumerate(model_kwargs['gm_resource'][2][:-1]):
+                    cur_params = torch.cat([p.data.to('cuda').reshape(-1) for p in ckpt], 0).requires_grad_(True)
+                    real_grad = model_kwargs['gm_resource'][3][i].to('cuda')
+                    pseudo_pred = model_kwargs['gm_resource'][1](pseudo_imgs, flat_param=cur_params)
+                    pseudo_loss = model_kwargs['gm_resource'][5](pseudo_pred, pseudo_target)
+                    # pseudo_grad = torch.autograd.grad(pseudo_loss, cur_params,create_graph=True, retain_graph=True)[0]
+                    pseudo_grad = torch.autograd.grad(pseudo_loss, cur_params, create_graph=True)[0]
+
+                    ckpt_gm_loss = gm_loss(pseudo_grad, real_grad) / len(model_kwargs['gm_resource'][2])
+                    # gm_guide += torch.autograd.grad(ckpt_gm_loss, x,create_graph=True, retain_graph=True)[0][0]
+                    if i < len(model_kwargs['gm_resource'][2])-1:
+                        gm_guide += torch.autograd.grad(ckpt_gm_loss, x, retain_graph=True)[0][0].data
+                    else:
+                        gm_guide += torch.autograd.grad(ckpt_gm_loss, x)[0][0].data
+            
+            rho_t = (out["l2"]/(gm_guide.data * gm_guide.data).mean().sqrt()) * self.sqrt_one_minus_alphas_cumprod[t[0]].item()
+            # print('gm_guide:', rho_t * model_kwargs['gm_resource'][-2]  * gm_guide)
+            used_sample1 = used_sample - rho_t * model_kwargs['gm_resource'][-2]  * gm_guide
+            
+            if len(model_kwargs['pseudo_memory_c'])>0:
+                with torch.enable_grad():
+                    neg_embeddings = torch.cat(model_kwargs['pseudo_memory_c']).flatten(start_dim=1)
+                    params = model_kwargs['gm_resource'][2][-1]
+                    params = torch.cat([p.data.to('cuda').reshape(-1) for p in params], 0).requires_grad_(True)
+                    _, feat = model_kwargs['gm_resource'][1](pseudo_imgs, flat_param=params, return_features=True)
+                    l2_distances = l2_distance(feat, neg_embeddings)[0]
+                    # print(l2_distances)
+                    neg_idx = l2_distances.argmin(dim=0).item()
+                    # print('neg_idx:',neg_idx)
+                    feat_guide = torch.autograd.grad(l2_distances[:][neg_idx], x)[0][0].data.detach()
                 
-                if model_kwargs['gm_resource'][6] > 1:
-                    # print('repeat:',model_kwargs['gm_resource'][6])
-                    model_kwargs['gm_resource'][6] -= 1
+                sigma_t = (out["l2"]/(feat_guide.data * feat_guide.data).mean().sqrt()) * self.sqrt_one_minus_alphas_cumprod[t[0]].item()
+                # print('feat_guide:', sigma_t * model_kwargs['gm_resource'][-1] * feat_guide)
+                used_sample1 = used_sample1 + sigma_t * model_kwargs['gm_resource'][-1] * feat_guide 
 
-                    epsilon2 = torch.randn_like(used_sample1)
-                    beta_bar = _extract_into_tensor(self.betas, t[0], used_sample1.shape)
+                # if len(model_kwargs['pseudo_memory_c'])>0:
+                #     print('rm/gm ratio', ((sigma_t * model_kwargs['gm_resource'][-1] * feat_guide ) / (rho_t * model_kwargs['gm_resource'][-2]  * gm_guide)).mean())
+                
+                wandb.log({'gm_guide':(rho_t * model_kwargs['gm_resource'][-2]  * gm_guide).mean().item(), 'feat_guide':(sigma_t * model_kwargs['gm_resource'][-1] * feat_guide).mean().item()})
+                wandb.log({'Min l2':l2_distances[:][neg_idx].item()})
+                
+                del feat_guide, params, feat, l2_distances, neg_embeddings
 
-                    sample[0,:,:,:] = th.sqrt(1 - beta_bar) * used_sample1 + th.sqrt(beta_bar) * epsilon2
-                    out = self.p_sample(
-                        model,
-                        sample.detach().data,
-                        t,
-                        clip_denoised=clip_denoised,
-                        denoised_fn=denoised_fn,
-                        cond_fn=cond_fn,
-                        model_kwargs=model_kwargs,)
-                    sample = out['sample']
-                else:
-                    sample[0,:,:,:] = used_sample1
-                    # reset the count for recursion
-                    model_kwargs['gm_resource'][6] = model_kwargs['gm_resource'][7]
+            
+            
 
+
+            del gm_guide, cur_params, pseudo_imgs, pseudo_grad, used_sample, x
+
+            gc.collect()
+            torch.cuda.empty_cache()
+            
+            if model_kwargs['gm_resource'][6] > 1:
+                # print('repeat:',model_kwargs['gm_resource'][6])
+                model_kwargs['gm_resource'][6] -= 1
+
+                epsilon2 = torch.randn_like(used_sample1)
+                beta_bar = _extract_into_tensor(self.betas, t[0], used_sample1.shape)
+
+                sample[0,:,:,:] = th.sqrt(1 - beta_bar) * used_sample1 + th.sqrt(beta_bar) * epsilon2
+                out = self.p_sample(
+                    model,
+                    sample.detach().data,
+                    t,
+                    clip_denoised=clip_denoised,
+                    denoised_fn=denoised_fn,
+                    cond_fn=cond_fn,
+                    model_kwargs=model_kwargs,)
+                sample = out['sample']
+            else:
+                sample[0,:,:,:] = used_sample1
+                # reset the count for recursion
+                model_kwargs['gm_resource'][6] = model_kwargs['gm_resource'][7]
+        
         # except:
         else:
             # print('true1')

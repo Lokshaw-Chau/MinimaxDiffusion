@@ -1,5 +1,4 @@
-
-export CUDA_VISIBLE_DEVICES=1
+export CUDA_VISIBLE_DEVICES=0
 
 ################## influence guided sample ###################
 # k=5 # 
@@ -27,6 +26,7 @@ export CUDA_VISIBLE_DEVICES=1
 #         -n resnet --depth 18 --nclass 10 --norm_type instance --ipc 50 --tag igd_woof --slct_type random --spec woof
 
 k=5
+f=50
 low=30
 high=45
 gi=200
@@ -40,15 +40,17 @@ phase=0 # end 7
 nclass=10
 tart_ncls=10
 d=6
+guide_type=rgd
 
-python igd_sample.py --model DiT-XL/2 --image-size 256 --ckpt /root/workspace/MinimaxDiffusion/pretrained_models/DiT-XL-2-256x256.pt \
-    --save-dir "./results/dit-igd/${spec}-${nsample}-test-${cp}-${ntype}-k${k}-gamma${gamma}-r${r}-gi${gi}-low${low}-high${high}" --data-path /root/share/ImageNet/train \
-    --spec ${spec} --gm-scale ${k} --grad-ipc ${gi} --net-type ${ntype} --depth 10 \
-    --low ${low} --high ${high} --ckpt_path ${cp} --repeat ${r} --num-samples ${nsample} --lambda-neg ${gamma} \
-    --nclass ${nclass} --phase ${phase} --target_nclass ${tart_ncls} --guide_type igd --memory-size 100
+# python igd_sample.py --model DiT-XL/2 --image-size 256 --ckpt /root/workspace/MinimaxDiffusion/pretrained_models/DiT-XL-2-256x256.pt \
+#     --save-dir "./results/dit-${guide_type}/${spec}-${nsample}-${cp}-${ntype}-k${k}-f${f}-gamma${gamma}-r${r}-gi${gi}-low${low}-high${high}_test" --data-path /root/share/ImageNet/train \
+#     --spec ${spec} --gm-scale ${k} --grad-ipc ${gi} --net-type ${ntype} --depth 10 \
+#     --low ${low} --high ${high} --ckpt_path ${cp} --repeat ${r} --num-samples ${nsample} --lambda-neg ${gamma} \
+#     --nclass ${nclass} --phase ${phase} --target_nclass ${tart_ncls} --guide_type ${guide_type} --f-scale ${f}
 
-# python train.py -d imagenet --imagenet_dir ./results/dit-igd/${spec}-${nsample}-wo_diversity-${cp}-${ntype}-k${k}-gamma${gamma}-r${r}-gi${gi}-low${low}-high${high} /root/share/ImageNet \
-#         -n resnet --depth 18 --nclass 10 --norm_type instance --ipc 50 --tag igd_woof_wo_diverstiy --slct_type random --spec woof --repeat 3
+python train.py -d imagenet --imagenet_dir ./results/dit-${guide_type}/${spec}-${nsample}-${cp}-${ntype}-k${k}-f${f}-gamma${gamma}-r${r}-gi${gi}-low${low}-high${high} /root/share/ImageNet \
+        -n resnet --depth 18 --nclass 10 --norm_type instance --ipc 50 --tag rgd_woof_ipc50_f${f} --slct_type random --spec woof --repeat 3
 
-# python train.py -d imagenet --imagenet_dir ./results/dit-igd/${spec}-${nsample}-wo_diversity-${cp}-${ntype}-k${k}-gamma${gamma}-r${r}-gi${gi}-low${low}-high${high} /root/share/ImageNet \
-#         -n resnet --depth 18 --nclass 10 --norm_type instance --ipc 100 --tag igd_woof_wo_diverstiy --slct_type random --spec woof --repeat 1
+python train.py -d imagenet --imagenet_dir ./results/dit-${guide_type}/${spec}-${nsample}-${cp}-${ntype}-k${k}-f${f}-gamma${gamma}-r${r}-gi${gi}-low${low}-high${high} /root/share/ImageNet \
+        -n resnet --depth 18 --nclass 10 --norm_type instance --ipc 100 --tag rgd_woof_ipc100_f${f} --slct_type random --spec woof --repeat 1
+

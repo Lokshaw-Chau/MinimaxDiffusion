@@ -1,0 +1,13 @@
+CUDA_VISIBLE_DEVICES=1 python main.py \
+--subset "imagenet-woof" \
+--spec "woof" \
+--tag "igd" \
+--arch-name "resnet18" \
+--factor 2 \
+--mipc 1000 \
+--ipc 100 \
+--stud-name "resnet18" \
+--re-epochs 1000 \
+--re-batch-size 50 \
+--val-dir '/root/share/ImageNet/val' \
+--syn-data-path '/root/workspace/MinimaxDiffusion/results/dit-igd/woof-100-dit-igd-ckpts-convnet6-k5-gamma120-r1-gi200-low30-high45' 

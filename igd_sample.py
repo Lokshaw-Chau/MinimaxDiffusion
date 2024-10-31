@@ -23,6 +23,7 @@ import train_models.convnet as CN
 import train_models.densenet_cifar as DN
 import time
 from reparam_module import ReparamModule
+import wandb
 import torch.nn as nn
 
 def center_crop_arr(pil_image, image_size):
@@ -114,7 +115,7 @@ def rand_ckpts(args):
         if args.ckpt_path.startswith('ckpts'):
             if args.net_type == 'convnet6':
                 #idxs = [0,5,16,40]
-                idxs = [0, 4, 14, 36]
+                idxs = [0, 4, 14, 36, -1]
             # elif args.ckpt_path.startswith('ema'):
             #     idxs = [0,7,25]
             elif args.net_type == 'resnet_ap':
@@ -241,6 +242,10 @@ def get_grads(sel_classes, class_labels, sel_class, ckpts, surrogate, device='cu
     return real_gradients, y, correspond_labels
 
 def main(args):
+    # set wandb
+    wandb.init(project='guidance sampling', name='igd', config=args)
+
+
     # Setup PyTorch:
     torch.manual_seed(args.seed)
     # torch.set_grad_enabled(False)
@@ -306,7 +311,7 @@ def main(args):
     for class_label, sel_class in zip(class_labels, sel_classes):
         os.makedirs(os.path.join(args.save_dir, sel_class), exist_ok=True)
         print(sel_class)
-        real_gradients, cur_cls, correspond_labels  = get_grads(sel_classes, class_labels, sel_class, ckpts, surrogate)
+        real_gradients, cur_cls, correspond_labels  = get_grads(sel_classes, class_labels, sel_class, surrogate=surrogate, ckpts=ckpts[:-1])
         # print('class_label',class_label)
         # print('cur_cls',cur_cls)
         assert class_label == cur_cls
@@ -321,8 +326,8 @@ def main(args):
             y_null = torch.tensor([1000] * batch_size, device=device)
             y = torch.cat([y, y_null], 0)
 
-            gm_resource = [vae, surrogate, ckpts, real_gradients[class_label], correspond_labels[class_label], criterion_ce, args.repeat, args.repeat, args.gm_scale]
-            model_kwargs = dict(y=y, cfg_scale=args.cfg_scale, gm_resource=gm_resource, gen_type='igd',low=args.low,high=args.high, pseudo_memory_c=pseudo_memory_c, neg_e=args.lambda_neg)
+            gm_resource = [vae, surrogate, ckpts, real_gradients[class_label], correspond_labels[class_label], criterion_ce, args.repeat, args.repeat, args.gm_scale, args.f_scale]
+            model_kwargs = dict(y=y, cfg_scale=args.cfg_scale, gm_resource=gm_resource, gen_type=args.guide_type, low=args.low, high=args.high, pseudo_memory_c=pseudo_memory_c, neg_e=args.lambda_neg)
 
             # Sample images:
             samples = diffusion.p_sample_loop(
@@ -330,11 +335,21 @@ def main(args):
             # print('samples',samples.shape)
             samples, _ = samples.chunk(2, dim=0)  # Remove null class samples
             # add psuedo samples to the memory
-            pseudo_memory_c.extend(samples.detach().split(1))
-            while len(pseudo_memory_c) > args.memory_size:
-                pseudo_memory_c.pop(0)
+            if args.guide_type == 'igd':
+                # latent space
+                pseudo_memory_c.extend(samples.detach().split(1))
+                
             samples = vae.decode(samples / 0.18215).sample
             # Save and display images:
+            if args.guide_type == 'rgd':
+                # representation space
+                params = torch.cat([p.data.to('cuda').reshape(-1) for p in ckpts[-1]], 0).requires_grad_(True)
+                _, feat = surrogate(samples, flat_param=params, return_features=True)
+                pseudo_memory_c.extend(feat.detach().split(1))
+                
+            while len(pseudo_memory_c) > args.memory_size:
+                    pseudo_memory_c.pop(0)
+
             for image_index, image in enumerate(samples):
                 save_image(image, os.path.join(args.save_dir, sel_class,
                                                f"{image_index + shift * batch_size + args.total_shift}.png"), normalize=True, value_range=(-1, 1))
@@ -361,18 +376,20 @@ if __name__ == "__main__":
     parser.add_argument("--target_nclass", type=int, default=1000, help='the class number for generation')
     parser.add_argument("--depth", type=int, default=10, help='the network depth')
     parser.add_argument("--phase", type=int, default=0, help='the phase number for generating large datasets')
-    parser.add_argument("--memory-size", type=int, default=64, help='the memory size')
+    parser.add_argument("--memory-size", type=int, default=100, help='the memory size')
     parser.add_argument("--real_ipc", type=int, default=1000, help='the number of samples participating in the fine-tuning')
     parser.add_argument("--grad-ipc", type=int, default=80, help='the number of samples participating in the fine-tuning')
     parser.add_argument('--lambda-pos', default=0.03, type=float, help='weight for representativeness constraint')
     parser.add_argument('--lambda-neg', default=0.01, type=float, help='weight for diversity constraint')
     parser.add_argument("--data-path", type=str, required=True)
     parser.add_argument("--net-type", type=str, default='convnet6')
-    parser.add_argument("--gm-scale", type=float, default=0.02) # 
+    parser.add_argument("--gm-scale", type=float, default=0.02)
+    parser.add_argument("--f-scale", type=float, default=0.02)
     parser.add_argument("--low", type=int, default=500, help='allowed lowest time step for gm guidance')
     parser.add_argument("--high", type=int, default=800, help='allowed highest time step for gm guidance')
     parser.add_argument("--ckpt_path", type=str, required=True)
     parser.add_argument("--repeat", type=int, required=True, help='repeat for the GM recursive during low-high sampling steps')
+    parser.add_argument("--guide_type", type=str, default='igd', help='the guidance type for the generation')
     args = parser.parse_args()
     print('args\n',args)
     main(args)
