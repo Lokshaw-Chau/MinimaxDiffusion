@@ -39,15 +39,19 @@ def cosine_similarity(ta, tb):
                 torch.norm(tb, dim=-1).view(1, bs2).repeat(bs1, 1)
     return frac_up / frac_down
 
-def l2_distance(ta, tb):
-    # calculate the l2 distance between ta and tb pair wise
-    bs1, bs2 = ta.shape[0], tb.shape[0]
-    ta = ta.view(bs1, -1)
-    tb = tb.view(bs2, -1)
-    ta = ta.unsqueeze(1).expand(bs1, bs2, -1)
-    tb = tb.unsqueeze(0).expand(bs1, bs2, -1)
-    return torch.norm(ta - tb, dim=-1)
-
+# def l2_distance(ta, tb):
+#     # calculate the l2 distance between ta and tb pair wise
+#     bs1, bs2 = ta.shape[0], tb.shape[0]
+#     ta = ta.view(bs1, -1)
+#     tb = tb.view(bs2, -1)
+#     ta = ta.unsqueeze(1).expand(bs1, bs2, -1)
+#     tb = tb.unsqueeze(0).expand(bs1, bs2, -1)
+#     return torch.norm(ta - tb, dim=-1)
+def mean_flat(x):
+    """
+    Take the mean over all non-batch dimensions.
+    """
+    return torch.mean(x, dim=list(range(1, len(x.size()))))
 
 class ModelVarType(enum.Enum):
     """
@@ -542,10 +546,10 @@ class GaussianDiffusion:
             # rho_t = out["l2"] / (gm_guide * gm_guide).mean().sqrt().item()    
             rho_t =   (out["l2"]/(gm_guide.data * gm_guide.data).mean().sqrt()) * self.sqrt_one_minus_alphas_cumprod[t[0]].item()
             
-            used_sample1 = used_sample - rho_t * model_kwargs['gm_resource'][-2]  * gm_guide
+            used_sample1 = used_sample - rho_t * model_kwargs['gm_resource'][-3]  * gm_guide
             
             if len(model_kwargs['pseudo_memory_c'])>0:
-                wandb.log({'gm_guide':(rho_t * model_kwargs['gm_resource'][-2]  * gm_guide).mean().item(), 'latent_guide':(model_kwargs['neg_e'] * cos_guide).mean().item()})
+                wandb.log({'gm_guide':(rho_t * model_kwargs['gm_resource'][-3]  * gm_guide).mean().item(), 'latent_guide':(model_kwargs['neg_e'] * cos_guide).mean().item()})
                 # print('cos/gm ratio', ((model_kwargs['neg_e'] * cos_guide) / (rho_t * model_kwargs['gm_resource'][-2]  * gm_guide)).mean())
             
             del gm_guide, cur_params, pseudo_imgs, pseudo_grad, used_sample, x
@@ -624,31 +628,49 @@ class GaussianDiffusion:
             
             rho_t = (out["l2"]/(gm_guide.data * gm_guide.data).mean().sqrt()) * self.sqrt_one_minus_alphas_cumprod[t[0]].item()
             # print('gm_guide:', rho_t * model_kwargs['gm_resource'][-2]  * gm_guide)
-            used_sample1 = used_sample - rho_t * model_kwargs['gm_resource'][-2]  * gm_guide
+            used_sample1 = used_sample - rho_t * model_kwargs['gm_resource'][-3]  * gm_guide
             
             if len(model_kwargs['pseudo_memory_c'])>0:
                 with torch.enable_grad():
-                    neg_embeddings = torch.cat(model_kwargs['pseudo_memory_c']).flatten(start_dim=1)
-                    params = model_kwargs['gm_resource'][2][-1]
-                    params = torch.cat([p.data.to('cuda').reshape(-1) for p in params], 0).requires_grad_(True)
-                    _, feat = model_kwargs['gm_resource'][1](pseudo_imgs, flat_param=params, return_features=True)
-                    l2_distances = l2_distance(feat, neg_embeddings)[0]
+                    neg_embeddings = torch.cat(model_kwargs['pseudo_memory_c'])
+                    # params = model_kwargs['gm_resource'][2][-1]
+                    # params = torch.cat([p.data.to('cuda').reshape(-1) for p in params], 0).requires_grad_(True)
+                    # _, feat = model_kwargs['gm_resource'][1](pseudo_imgs, flat_param=params, return_features=True)
+                    pseudo_img = pseudo_imgs.chunk(2, dim=0)[0]
+                    pseudo_img = torch.nn.functional.interpolate(pseudo_img, 224, mode='bicubic')
+                    encoder = model_kwargs['gm_resource'][-1]
+                    feat = encoder.forward_features(pseudo_img)
+                    feat = feat['x_norm_patchtokens']
+                    # print(feat.shape)
+                    feat = torch.nn.functional.normalize(feat, dim=-1)
+                    # feat = feat.unsqueeze(0)
+                    # print(feat.shape)
+                    # print(neg_embeddings.shape)
+                    feat = feat.repeat(neg_embeddings.shape[0], 1, 1)
+                    cossims = mean_flat((feat * neg_embeddings).sum(dim=-1))
+                    # print(cossims)
+                    cos_sim = cossims.max()
+                    # neg_idx = cosine_similarity(
+                    #     feat, neg_embeddings
+                    # )[0].argmax().item()
+                    # cos_sim = cos_loss(feat.flatten(), model_kwargs['pseudo_memory_c'][neg_idx].flatten(start_dim=1))
+                    # l2_distances = l2_distance(feat, neg_embeddings)[0]
                     # print(l2_distances)
-                    neg_idx = l2_distances.argmin(dim=0).item()
+                    # neg_idx = l2_distances.argmin(dim=0).item()
                     # print('neg_idx:',neg_idx)
-                    feat_guide = torch.autograd.grad(l2_distances[:][neg_idx], x)[0][0].data.detach()
+                    feat_guide = torch.autograd.grad(cos_sim, x)[0][0].data.detach()
                 
                 sigma_t = (out["l2"]/(feat_guide.data * feat_guide.data).mean().sqrt()) * self.sqrt_one_minus_alphas_cumprod[t[0]].item()
                 # print('feat_guide:', sigma_t * model_kwargs['gm_resource'][-1] * feat_guide)
-                used_sample1 = used_sample1 + sigma_t * model_kwargs['gm_resource'][-1] * feat_guide 
+                used_sample1 = used_sample1 - sigma_t * model_kwargs['gm_resource'][-2] * feat_guide 
 
                 # if len(model_kwargs['pseudo_memory_c'])>0:
                 #     print('rm/gm ratio', ((sigma_t * model_kwargs['gm_resource'][-1] * feat_guide ) / (rho_t * model_kwargs['gm_resource'][-2]  * gm_guide)).mean())
                 
-                wandb.log({'gm_guide':(rho_t * model_kwargs['gm_resource'][-2]  * gm_guide).mean().item(), 'feat_guide':(sigma_t * model_kwargs['gm_resource'][-1] * feat_guide).mean().item()})
-                wandb.log({'Min l2':l2_distances[:][neg_idx].item()})
+                wandb.log({'gm_guide':(rho_t * model_kwargs['gm_resource'][-3]  * gm_guide).mean().item(), 'feat_guide':(sigma_t * model_kwargs['gm_resource'][-2] * feat_guide).mean().item()})
+                wandb.log({'max similarity':cos_sim})
                 
-                del feat_guide, params, feat, l2_distances, neg_embeddings
+                del feat_guide, feat, neg_embeddings
 
             
             

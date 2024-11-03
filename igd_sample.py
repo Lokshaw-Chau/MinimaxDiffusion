@@ -25,6 +25,7 @@ import time
 from reparam_module import ReparamModule
 import wandb
 import torch.nn as nn
+import timm
 
 def center_crop_arr(pil_image, image_size):
     """
@@ -133,7 +134,7 @@ def rand_ckpts(args):
     elif  args.spec == 'nette':
         if args.ckpt_path.startswith('ckpt'):
             if args.net_type == 'convnet6':
-                idxs = [0,2,11,40]
+                idxs = [0,2, 8, 22, -1]
             elif args.net_type == 'resnet_ap':
                 idxs = [0,6,16,39]
             elif args.net_type == 'resnet':
@@ -304,6 +305,19 @@ def main(args):
     surrogate.eval()
     # surrogate.train()
     ckpts = rand_ckpts(args)
+    # add feature extractor to ckpts
+
+    # if args.feat_extractor == 'dinov2':
+    # ckpts.remove(ckpts[-1])
+    encoder = torch.hub.load('facebookresearch/dinov2', 'dinov2_vits14_reg')
+    del encoder.head
+    encoder.pos_embed.data = timm.layers.pos_embed.resample_abs_pos_embed(
+        encoder.pos_embed.data, [16, 16],
+    )
+    encoder.head = torch.nn.Identity()
+    encoder = encoder.to(args.device)
+    encoder.eval()
+
     criterion_ce = nn.CrossEntropyLoss().to(args.device)
 
     
@@ -326,7 +340,7 @@ def main(args):
             y_null = torch.tensor([1000] * batch_size, device=device)
             y = torch.cat([y, y_null], 0)
 
-            gm_resource = [vae, surrogate, ckpts, real_gradients[class_label], correspond_labels[class_label], criterion_ce, args.repeat, args.repeat, args.gm_scale, args.f_scale]
+            gm_resource = [vae, surrogate, ckpts, real_gradients[class_label], correspond_labels[class_label], criterion_ce, args.repeat, args.repeat, args.gm_scale, args.f_scale, encoder]
             model_kwargs = dict(y=y, cfg_scale=args.cfg_scale, gm_resource=gm_resource, gen_type=args.guide_type, low=args.low, high=args.high, pseudo_memory_c=pseudo_memory_c, neg_e=args.lambda_neg)
 
             # Sample images:
@@ -343,8 +357,13 @@ def main(args):
             # Save and display images:
             if args.guide_type == 'rgd':
                 # representation space
-                params = torch.cat([p.data.to('cuda').reshape(-1) for p in ckpts[-1]], 0).requires_grad_(True)
-                _, feat = surrogate(samples, flat_param=params, return_features=True)
+                # params = torch.cat([p.data.to('cuda').reshape(-1) for p in ckpts[-1]], 0).requires_grad_(True)
+                # _, feat = surrogate(samples, flat_param=params, return_features=True)
+                forward_img =torch.nn.functional.interpolate(samples, 224, mode='bicubic')
+                feat = encoder.forward_features(forward_img)
+                feat = feat['x_norm_patchtokens']
+                print('feat',feat.shape)
+                feat = nn.functional.normalize(feat, dim=-1)
                 pseudo_memory_c.extend(feat.detach().split(1))
                 
             while len(pseudo_memory_c) > args.memory_size:
@@ -385,6 +404,7 @@ if __name__ == "__main__":
     parser.add_argument("--net-type", type=str, default='convnet6')
     parser.add_argument("--gm-scale", type=float, default=0.02)
     parser.add_argument("--f-scale", type=float, default=0.02)
+    parser.add_argument("--feat-extractor", type=str, default='dinov2')
     parser.add_argument("--low", type=int, default=500, help='allowed lowest time step for gm guidance')
     parser.add_argument("--high", type=int, default=800, help='allowed highest time step for gm guidance')
     parser.add_argument("--ckpt_path", type=str, required=True)

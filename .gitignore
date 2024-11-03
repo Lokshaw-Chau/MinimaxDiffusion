@@ -1,5 +1,6 @@
 # Customized
 *.pt
+*.pth
 results/
 *.pdf
 

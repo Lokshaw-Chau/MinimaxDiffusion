@@ -1,5 +1,5 @@
-export CUDA_VISIBLE_DEVICES=3
-spec=woof
+export CUDA_VISIBLE_DEVICES=2
+spec=nette
 model=convnet6
 
 

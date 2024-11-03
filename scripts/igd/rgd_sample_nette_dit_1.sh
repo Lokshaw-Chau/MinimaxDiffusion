@@ -1,4 +1,4 @@
-export CUDA_VISIBLE_DEVICES=1
+export CUDA_VISIBLE_DEVICES=2
 
 k=5
 # f=50
@@ -17,9 +17,8 @@ tart_ncls=10
 d=6
 guide_type=rgd
 
-# woof
-spec=woof
-for f in 100 5 7 9; do
+spec=nette
+for f in 10 13 ; do
 
         python igd_sample.py --model DiT-XL/2 --image-size 256 --ckpt /root/workspace/MinimaxDiffusion/pretrained_models/DiT-XL-2-256x256.pt \
         --save-dir "./results/dit-${guide_type}-dino/${spec}-${nsample}-${cp}-${ntype}-k${k}-f${f}-gamma${gamma}-r${r}-gi${gi}-low${low}-high${high}" --data-path /root/share/ImageNet/train \
@@ -28,12 +27,13 @@ for f in 100 5 7 9; do
         --nclass ${nclass} --phase ${phase} --target_nclass ${tart_ncls} --guide_type ${guide_type} --f-scale ${f}
 
         python train.py -d imagenet --imagenet_dir ./results/dit-${guide_type}-dino/${spec}-${nsample}-${cp}-${ntype}-k${k}-f${f}-gamma${gamma}-r${r}-gi${gi}-low${low}-high${high} /root/share/ImageNet \
-                -n resnet --depth 18 --nclass 10 --norm_type instance --ipc 10 --tag rgd_dino_woof_ipc10_f${f} --slct_type random --spec ${spec} --repeat 3
+                -n resnet --depth 18 --nclass 10 --norm_type instance --ipc 10 --tag rgd_dino_${spec}_ipc10_f${f} --slct_type random --spec ${spec} --repeat 3
         
         python train.py -d imagenet --imagenet_dir ./results/dit-${guide_type}-dino/${spec}-${nsample}-${cp}-${ntype}-k${k}-f${f}-gamma${gamma}-r${r}-gi${gi}-low${low}-high${high} /root/share/ImageNet \
-                -n resnet --depth 18 --nclass 10 --norm_type instance --ipc 50 --tag rgd_dino_woof_ipc50_f${f} --slct_type random --spec ${spec} --repeat 3
+                -n resnet --depth 18 --nclass 10 --norm_type instance --ipc 50 --tag rgd_dino_${spec}_ipc50_f${f} --slct_type random --spec ${spec} --repeat 3
 
         python train.py -d imagenet --imagenet_dir ./results/dit-${guide_type}-dino/${spec}-${nsample}-${cp}-${ntype}-k${k}-f${f}-gamma${gamma}-r${r}-gi${gi}-low${low}-high${high} /root/share/ImageNet \
-                -n resnet --depth 18 --nclass 10 --norm_type instance --ipc 100 --tag rgd_dino_woof_ipc100_f${f} --slct_type random --spec ${spec} --repeat 1
+                -n resnet --depth 18 --nclass 10 --norm_type instance --ipc 100 --tag rgd_dino_${spec}_ipc100_f${f} --slct_type random --spec ${spec} --repeat 1
 
 done
+
