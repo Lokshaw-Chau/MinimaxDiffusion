@@ -11,25 +11,25 @@ for i in  {1,2,3,4,5}
 do
 
     # run validation
-    python train.py -d imagenet --imagenet_dir /root/workspace/MinimaxDiffusion/results/dit-distillation/ImagenetIDC-ipc10-minimax_$i /root/share/ImageNet \
-        -n resnet --depth 18 --nclass 10 --norm_type instance --ipc 10 --tag idc_$i --slct_type random --spec none
+    python train.py -d imagenet --imagenet_dir /root/workspace/MinimaxDiffusion/results/dit-rgd/woof-100-ckpts-convnet6-k5-f1-gamma120-r1-gi200-low30-high45 /root/share/ImageNet \
+        -n resnet --depth 18 --nclass 10 --norm_type instance --ipc 10 --tag test --slct_type random --spec woof
 
     python train.py -d imagenet --imagenet_dir /root/workspace/MinimaxDiffusion/results/dit-distillation/ImagenetWoof-ipc10-minimax_$i /root/share/ImageNet \
         -n resnet --depth 18 --nclass 10 --norm_type instance --ipc 10 --tag woof_$i --slct_type random --spec woof 
 
 done
 
-for i in  {1,2,3,4,5}
-do
+# for i in  {1,2,3,4,5}
+# do
 
-    # run validation
-    python train.py -d imagenet --imagenet_dir /root/workspace/MinimaxDiffusion/results/dit-distillation/ImagenetIDC-ipc50-minimax_$i /root/share/ImageNet \
-        -n resnet --depth 18 --nclass 10 --norm_type instance --ipc 50 --tag idc_$i --slct_type random --spec none
+#     # run validation
+#     python train.py -d imagenet --imagenet_dir /root/workspace/MinimaxDiffusion/results/dit-distillation/ImagenetIDC-ipc50-minimax_$i /root/share/ImageNet \
+#         -n resnet --depth 18 --nclass 10 --norm_type instance --ipc 50 --tag idc_$i --slct_type random --spec none
 
-    python train.py -d imagenet --imagenet_dir /root/workspace/MinimaxDiffusion/results/dit-distillation/ImagenetWoof-ipc50-minimax_$i /root/share/ImageNet \
-        -n resnet --depth 18 --nclass 10 --norm_type instance --ipc 50 --tag woof_$i --slct_type random --spec woof 
+#     python train.py -d imagenet --imagenet_dir /root/workspace/MinimaxDiffusion/results/dit-distillation/ImagenetWoof-ipc50-minimax_$i /root/share/ImageNet \
+#         -n resnet --depth 18 --nclass 10 --norm_type instance --ipc 50 --tag woof_$i --slct_type random --spec woof 
 
-done
+# done
 # for i in  {1,2,3,4,5}
 # do
 #     # run sample generation

@@ -370,9 +370,10 @@ def main(args):
                     pseudo_memory_c.pop(0)
 
             for image_index, image in enumerate(samples):
+                file_number = image_index + shift * batch_size + args.total_shift
                 save_image(image, os.path.join(args.save_dir, sel_class,
-                                               f"{image_index + shift * batch_size + args.total_shift}.png"), normalize=True, value_range=(-1, 1))
-
+                                               f"{file_number:04d}.png"), normalize=True, value_range=(-1, 1))
+    
     print('following is the result of pos_e %s and neg_e %s'%(args.lambda_pos, args.lambda_neg))
 
 

@@ -19,7 +19,7 @@ guide_type=rgd
 
 # woof
 spec=woof
-for f in 100 5 7 9; do
+for f in 11 13 17 20; do
 
         python igd_sample.py --model DiT-XL/2 --image-size 256 --ckpt /root/workspace/MinimaxDiffusion/pretrained_models/DiT-XL-2-256x256.pt \
         --save-dir "./results/dit-${guide_type}-dino/${spec}-${nsample}-${cp}-${ntype}-k${k}-f${f}-gamma${gamma}-r${r}-gi${gi}-low${low}-high${high}" --data-path /root/share/ImageNet/train \
