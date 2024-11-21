@@ -152,9 +152,9 @@ def rand_ckpts(args):
     print('ckpt idxs:',idxs)
     return [ckpts[ii] for ii in idxs]
 
-def get_grads(sel_classes, class_labels, sel_class, ckpts, surrogate, device='cuda'):
+def get_grads(args, sel_classes, class_labels, sel_class, ckpts, surrogate, device='cuda'):
     # Setup data:
-    criterion_ce = nn.CrossEntropyLoss().to(device)
+    criterion_ce = nn.CrossEntropyLoss(reduction='none').to(device)
     correspond_labels = defaultdict(list)
     grads_memory = []
     transform = transforms.Compose([
@@ -175,7 +175,7 @@ def get_grads(sel_classes, class_labels, sel_class, ckpts, surrogate, device='cu
         shuffle=False,
         num_workers=0,
         pin_memory=True,
-        drop_last=True
+        drop_last=False
     )
     # print(f"Dataset contains {len(dataset):,} images ({args.data_path})")
     print('load real grad memory ')
@@ -192,44 +192,68 @@ def get_grads(sel_classes, class_labels, sel_class, ckpts, surrogate, device='cu
 
         # print('all_len',all_len)
         # if all_len>=args.nclass*args.grad_ipc:
-        if len(grads_memory)>args.grad_ipc:
-            break
-
-    grads_memory = grads_memory[:args.grad_ipc]
-    assert len(grads_memory) == args.grad_ipc
-    print('grad memory len', len(grads_memory))
+        # if len(grads_memory)>args.grad_ipc:
+            # break
+    
+    # import pdb
+    # pdb.set_trace()
+    # grads_memory = grads_memory[:args.grad_ipc]
+    # assert len(grads_memory) == args.grad_ipc
+    # print('grad memory len', len(grads_memory))
 
     real_gradients = defaultdict(list)
     # gap = args.grad_ipc // 4 if args.grad_ipc <= 100 else 25
-    gap = 50
-    gap_idxs = np.arange(0, args.grad_ipc, gap).tolist()
+    # random pic 
+    
     # print('start obtain real grad memory for influence function')
 
 
     correspond_y = correspond_labels[y]  
     # print('correspond_y',correspond_y)
     # print('y_key',y)
-    ckpt_grads = []
-    for ii, ckpt in enumerate(ckpts):
-        for gi in gap_idxs:
-            # print(gi)
-            # print(grad_memory[y][gi:gi+gap])
-            cur_embd0 = torch.stack(grads_memory[gi:gi+gap]).cpu().numpy()
-            cur_embds = torch.from_numpy(cur_embd0).squeeze(1).to(device).requires_grad_(True)
-            # print('111',cur_imgs.shape)
-            cur_params = torch.cat([p.data.to(device).reshape(-1) for p in ckpt], 0).requires_grad_(True)
-            if gi == 0:
-                acc_grad = torch.zeros(cur_params.shape)
-            real_pred = surrogate(cur_embds, flat_param=cur_params)
-            real_target = torch.tensor([np.ones(len(cur_embds))*correspond_y], dtype=torch.long, device=args.device).view(-1) 
-            # print('real_pred',real_pred)
-            real_loss = criterion_ce(real_pred, real_target)
-            # print('real_loss',real_loss)
-            real_grad = torch.autograd.grad(real_loss, cur_params)[0] #.detach().clone().requires_grad_(False)
-            # print('real_grad',real_grad)
-            acc_grad += real_grad.detach().data.cpu()
-        ckpt_grads.append(acc_grad / len(gap_idxs)) 
-    real_gradients[y]=ckpt_grads
+    # sort sample by loss
+    loss_list = []
+    gap = 100
+    gap_idxs = np.arange(0, len(grads_memory), gap).tolist()
+    for gi in gap_idxs:
+        cur_embd0 = torch.stack(grads_memory[gi:gi+gap]).cpu().numpy()
+        cur_embds = torch.from_numpy(cur_embd0).squeeze(1).to(device).requires_grad_(True)
+        cur_params = torch.cat([p.data.to(device).reshape(-1) for p in ckpts[-1]], 0).requires_grad_(True)
+        real_pred = surrogate(cur_embds, flat_param=cur_params)
+        real_target = torch.tensor([np.ones(len(cur_embds))*correspond_y], dtype=torch.long, device=args.device).view(-1) 
+        # print('real_pred',real_pred)
+        real_loss = criterion_ce(real_pred, real_target)
+        loss_list.extend(real_loss.detach())
+    loss_list = torch.stack(loss_list)
+    idxs = torch.argsort(loss_list)
+
+    # curriculum_len = len(idxs) / args.grad_ipc
+    curriculum_gradients_list = []
+
+    gap = 50
+    sample_per_curriculum = len(grads_memory) // args.curriculum_num
+    samples_in_curriculum = args.grad_ipc if args.grad_ipc <= sample_per_curriculum else sample_per_curriculum
+    gap_idxs = np.arange(0, samples_in_curriculum, gap).tolist()
+    print(gap_idxs)
+    for curriculum in range(args.curriculum_num):
+        sampled_mem_idx = idxs[curriculum*samples_in_curriculum:(curriculum+1)*samples_in_curriculum]
+        sampled_mem = [grads_memory[idx] for idx in sampled_mem_idx]
+        ckpt_grads = []
+        for ii, ckpt in enumerate(ckpts[:-1]):
+            for gi in gap_idxs:
+                cur_embd0 = torch.stack(sampled_mem[gi:gi+gap]).cpu().numpy()
+                cur_embds = torch.from_numpy(cur_embd0).squeeze(1).to(device).requires_grad_(True)
+                cur_params = torch.cat([p.data.to(device).reshape(-1) for p in ckpt], 0).requires_grad_(True)
+                if gi == 0:
+                    acc_grad = torch.zeros(cur_params.shape)
+                real_pred = surrogate(cur_embds, flat_param=cur_params)
+                real_target = torch.tensor([np.ones(len(cur_embds))*correspond_y], dtype=torch.long, device=args.device).view(-1) 
+                real_loss = criterion_ce(real_pred, real_target).mean()
+                real_grad = torch.autograd.grad(real_loss, cur_params)[0] #.detach().clone().requires_grad_(False)
+                acc_grad += real_grad.detach().data.cpu()
+            ckpt_grads.append(acc_grad / len(gap_idxs)) 
+        real_gradients[y]=ckpt_grads
+        curriculum_gradients_list.append(real_gradients)
     # del cur_imgs
     del cur_params
     del real_grad
@@ -240,7 +264,7 @@ def get_grads(sel_classes, class_labels, sel_class, ckpts, surrogate, device='cu
     surrogate.zero_grad()
     print('end')
     print('all real memory len', sum(len(lst) for lst in real_gradients.values()))
-    return real_gradients, y, correspond_labels
+    return curriculum_gradients_list, y, correspond_labels
 
 def main(args):
     # set wandb
@@ -309,28 +333,39 @@ def main(args):
 
     # if args.feat_extractor == 'dinov2':
     # ckpts.remove(ckpts[-1])
-    encoder = torch.hub.load('facebookresearch/dinov2', 'dinov2_vits14_reg')
-    del encoder.head
-    encoder.pos_embed.data = timm.layers.pos_embed.resample_abs_pos_embed(
-        encoder.pos_embed.data, [16, 16],
-    )
-    encoder.head = torch.nn.Identity()
-    encoder = encoder.to(args.device)
-    encoder.eval()
+    if args.guide_type == 'rgd':
+        encoder = torch.hub.load('facebookresearch/dinov2', 'dinov2_vits14_reg')
+        del encoder.head
+        encoder.pos_embed.data = timm.layers.pos_embed.resample_abs_pos_embed(
+            encoder.pos_embed.data, [16, 16],
+        )
+        encoder.head = torch.nn.Identity()
+        encoder = encoder.to(args.device)
+        encoder.eval()
+    else:
+        encoder = None
 
     criterion_ce = nn.CrossEntropyLoss().to(args.device)
 
     
     batch_size = 1
     for class_label, sel_class in zip(class_labels, sel_classes):
+        if os.path.exists(os.path.join(args.save_dir, sel_class)):
+            continue
         os.makedirs(os.path.join(args.save_dir, sel_class), exist_ok=True)
         print(sel_class)
-        real_gradients, cur_cls, correspond_labels  = get_grads(sel_classes, class_labels, sel_class, surrogate=surrogate, ckpts=ckpts[:-1])
+        # real_gradients, cur_cls, correspond_labels  = get_grads(args, sel_classes, class_labels, sel_class, surrogate=surrogate, ckpts=ckpts)
+        curriculum_gradients_list, cur_cls, correspond_labels  = get_grads(args, sel_classes, class_labels, sel_class, surrogate=surrogate, ckpts=ckpts)
         # print('class_label',class_label)
         # print('cur_cls',cur_cls)
         assert class_label == cur_cls
         pseudo_memory_c = []
         for shift in tqdm(range(args.num_samples // batch_size)):
+            # grad_schedule
+            schedule_gap = args.num_samples // args.curriculum_num
+            curriculum = shift // schedule_gap if shift // schedule_gap < args.curriculum_num else args.curriculum_num - 1
+            real_gradients = curriculum_gradients_list[curriculum]
+            
             # Create sampling noise:
             z = torch.randn(batch_size, 4, latent_size, latent_size, device=device)
             y = torch.tensor([class_label], device=device)
@@ -399,6 +434,7 @@ if __name__ == "__main__":
     parser.add_argument("--memory-size", type=int, default=100, help='the memory size')
     parser.add_argument("--real_ipc", type=int, default=1000, help='the number of samples participating in the fine-tuning')
     parser.add_argument("--grad-ipc", type=int, default=80, help='the number of samples participating in the fine-tuning')
+    parser.add_argument("--curriculum_num", type=int, default=4, help='the number of curriculums')
     parser.add_argument('--lambda-pos', default=0.03, type=float, help='weight for representativeness constraint')
     parser.add_argument('--lambda-neg', default=0.01, type=float, help='weight for diversity constraint')
     parser.add_argument("--data-path", type=str, required=True)
@@ -411,6 +447,7 @@ if __name__ == "__main__":
     parser.add_argument("--ckpt_path", type=str, required=True)
     parser.add_argument("--repeat", type=int, required=True, help='repeat for the GM recursive during low-high sampling steps')
     parser.add_argument("--guide_type", type=str, default='igd', help='the guidance type for the generation')
+    # parser.add_argument("--schedule_gap", type=int, default=200, help='the gap for the curriculum schedule')
     args = parser.parse_args()
     print('args\n',args)
     main(args)
