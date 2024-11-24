@@ -797,6 +797,11 @@ def load_data(args, tsne=False):
         train_transform, test_transform = transform_imagenet(augment=args.augment,
                                                              size=args.size,
                                                              from_tensor=False)
+        
+        def is_valid_file(file_path):
+            valid_extensions = ['.jpg', '.jpeg', '.png', '.ppm', '.bmp', '.pgm', '.tif', '.tiff']
+            return any(file_path.endswith(ext) for ext in valid_extensions) 
+
         train_dataset = ImageFolder(traindir,
                                     train_transform,
                                     nclass=args.nclass,
@@ -804,7 +809,8 @@ def load_data(args, tsne=False):
                                     slct_type=args.slct_type,
                                     ipc=args.ipc,
                                     load_memory=args.load_memory,
-                                    spec=args.spec)
+                                    spec=args.spec,
+                                    is_valid_file=is_valid_file)
         val_dataset = ImageFolder(valdir,
                                   test_transform,
                                   nclass=args.nclass,

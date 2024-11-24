@@ -4,6 +4,7 @@ from tqdm import tqdm
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 from torchvision.utils import save_image
+import torch.optim as optim
 from diffusion import create_diffusion
 from diffusers.models import AutoencoderKL
 from download import find_model
@@ -12,7 +13,7 @@ import argparse
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from torchvision import transforms
-from data import ImageFolder, ImageFolder_mp
+from data import ImageFolder, ImageFolder_mp, MultiEpochsDataLoader, transform_imagenet
 from collections import OrderedDict, defaultdict
 from PIL import Image
 import numpy as np
@@ -21,9 +22,13 @@ import train_models.resnet as RN
 import train_models.resnet_ap as RNAP
 import train_models.convnet as CN
 import train_models.densenet_cifar as DN
+from misc.utils import random_indices, rand_bbox, accuracy, AverageMeter
 import time
 from reparam_module import ReparamModule
+import wandb
 import torch.nn as nn
+import timm
+import random
 
 def center_crop_arr(pil_image, image_size):
     """
@@ -59,6 +64,7 @@ def define_model(args, nclass, logger=None, size=None):
         size = args.size
 
     if args.net_type == 'resnet':
+        args.depth = 18
         model = RN.ResNet(args.spec,
                           args.depth,
                           nclass,
@@ -150,9 +156,9 @@ def rand_ckpts(args):
     print('ckpt idxs:',idxs)
     return [ckpts[ii] for ii in idxs]
 
-def get_grads(sel_classes, class_labels, sel_class, ckpts, surrogate, device='cuda'):
+def get_curriculum_grads(args, sel_classes, class_labels, sel_class, ckpts, surrogate, curriculum_filter, device='cuda'):
     # Setup data:
-    criterion_ce = nn.CrossEntropyLoss().to(device)
+    criterion_ce = nn.CrossEntropyLoss(reduction='none').to(device)
     correspond_labels = defaultdict(list)
     grads_memory = []
     transform = transforms.Compose([
@@ -163,9 +169,6 @@ def get_grads(sel_classes, class_labels, sel_class, ckpts, surrogate, device='cu
     dataset = ImageFolder_mp(args.data_path, transform=transform, nclass=args.nclass,
                           ipc=args.real_ipc, spec=args.spec, phase=args.phase,
                           seed=0, return_origin=True, sel_class=sel_class) # target idx [0-nclss]
-    # dataset_real = ImageFolder(args.data_path, transform=transform, nclass=args.nclass,
-    #                       ipc=args.finetune_ipc, spec=args.spec, phase=args.phase,
-    #                       seed=0, slct_type='loss', return_origin=True)
 
     real_loader = DataLoader(
         dataset,
@@ -173,58 +176,79 @@ def get_grads(sel_classes, class_labels, sel_class, ckpts, surrogate, device='cu
         shuffle=False,
         num_workers=0,
         pin_memory=True,
-        drop_last=True
+        drop_last=False
     )
-    # print(f"Dataset contains {len(dataset):,} images ({args.data_path})")
+
     print('load real grad memory ')
     for x, ry, y in real_loader: # ry 是0-1的，y是在ori 1000个里的真实index
         # ry = ry.numpy()
         assert torch.all(y == y[0]), "Tensor y contains different values"
         x = x.to(device)
         y = int(y.numpy()[0])
-
-        # Update the auxiliary memories
         grads_memory.extend(x.detach().split(1))
-        # real_imgs[c].extend(x[y == c].detach().cpu().split(1))
         correspond_labels[y] = ry[0].cpu().numpy()
 
-        # print('all_len',all_len)
-        # if all_len>=args.nclass*args.grad_ipc:
-        if len(grads_memory)>args.grad_ipc:
-            break
-
-    grads_memory = grads_memory[:args.grad_ipc]
-    assert len(grads_memory) == args.grad_ipc
-    print('grad memory len', len(grads_memory))
-
     real_gradients = defaultdict(list)
-    # gap = args.grad_ipc // 4 if args.grad_ipc <= 100 else 25
-    gap = 50
-    gap_idxs = np.arange(0, args.grad_ipc, gap).tolist()
-    # print('start obtain real grad memory for influence function')
-
-
-    correspond_y = correspond_labels[y]  
-    # print('correspond_y',correspond_y)
-    # print('y_key',y)
-    ckpt_grads = []
-    for ii, ckpt in enumerate(ckpts):
+    correspond_y = correspond_labels[y]
+    
+    # judge by a trained model
+    # easiest sample from misclassified samples
+    if curriculum_filter is not None:
+        curriculum_filter.eval()
+        loss_list = []
+        is_correct_list = []
+        gap = 200
+        gap_idxs = np.arange(0, len(grads_memory), gap).tolist()
         for gi in gap_idxs:
-            # print(gi)
-            # print(grad_memory[y][gi:gi+gap])
             cur_embd0 = torch.stack(grads_memory[gi:gi+gap]).cpu().numpy()
+            cur_embds = torch.from_numpy(cur_embd0).squeeze(1).to(device).requires_grad_(False)
+            # cur_params = torch.cat([p.data.to(device).reshape(-1) for p in ckpts[-1]], 0).requires_grad_(True)
+            # real_pred = surrogate(cur_embds, flat_param=cur_params)
+            with torch.no_grad():
+                pred = curriculum_filter(cur_embds)
+                pred = curriculum_filter(cur_embds)
+                real_target = torch.tensor([np.ones(len(cur_embds))*correspond_y], dtype=torch.long, device=args.device).view(-1) 
+                is_correct = pred.argmax(1) == real_target
+                real_loss = criterion_ce(pred, real_target)
+                loss_list.extend(real_loss.detach())
+                is_correct_list.extend(is_correct)
+         
+        misclassified_idxs = torch.where(torch.tensor(is_correct_list) == 0)[0]
+        true_idxs = torch.where(torch.tensor(is_correct_list) == 1)[0]
+        print("number of misclassified samples:", len(misclassified_idxs))
+        # origin_loss_list = torch.stack(loss_list)
+        misclassified_loss_list = [loss_list[idx] for idx in misclassified_idxs]
+        misclassified_loss_list = torch.stack(misclassified_loss_list)
+        sorted_misclassified_idxs = torch.argsort(misclassified_loss_list)
+        if len(sorted_misclassified_idxs) < args.grad_ipc:
+            true_idxs = true_idxs.tolist()
+            sorted_misclassified_idxs = sorted_misclassified_idxs.tolist()
+            sorted_misclassified_idxs.extend(random.sample(true_idxs, args.grad_ipc - len(misclassified_idxs)))
+            idxs = sorted_misclassified_idxs
+        else:
+            idxs = sorted_misclassified_idxs[0:args.grad_ipc]
+            
+    else:
+        idxs = np.arange(0, len(grads_memory)).tolist()
+        random.shuffle(idxs)
+        idxs = idxs[0:args.grad_ipc]
+    
+    # get grad
+    gap = 100
+    gap_idxs = np.arange(0, args.grad_ipc, gap).tolist()
+    sampled_mem = [grads_memory[idx] for idx in idxs]
+    ckpt_grads = []
+    for ii, ckpt in enumerate(ckpts[:-1]):
+        for gi in gap_idxs:
+            cur_embd0 = torch.stack(sampled_mem[gi:gi+gap]).cpu().numpy()
             cur_embds = torch.from_numpy(cur_embd0).squeeze(1).to(device).requires_grad_(True)
-            # print('111',cur_imgs.shape)
             cur_params = torch.cat([p.data.to(device).reshape(-1) for p in ckpt], 0).requires_grad_(True)
             if gi == 0:
                 acc_grad = torch.zeros(cur_params.shape)
             real_pred = surrogate(cur_embds, flat_param=cur_params)
             real_target = torch.tensor([np.ones(len(cur_embds))*correspond_y], dtype=torch.long, device=args.device).view(-1) 
-            # print('real_pred',real_pred)
-            real_loss = criterion_ce(real_pred, real_target)
-            # print('real_loss',real_loss)
+            real_loss = criterion_ce(real_pred, real_target).mean()
             real_grad = torch.autograd.grad(real_loss, cur_params)[0] #.detach().clone().requires_grad_(False)
-            # print('real_grad',real_grad)
             acc_grad += real_grad.detach().data.cpu()
         ckpt_grads.append(acc_grad / len(gap_idxs)) 
     real_gradients[y]=ckpt_grads
@@ -238,9 +262,126 @@ def get_grads(sel_classes, class_labels, sel_class, ckpts, surrogate, device='cu
     surrogate.zero_grad()
     print('end')
     print('all real memory len', sum(len(lst) for lst in real_gradients.values()))
+    
     return real_gradients, y, correspond_labels
 
+def train_filter(args, image_per_class):
+    total_sample_nums = image_per_class * args.nclass
+    # hyperparameters
+    bsz = 64
+    if total_sample_nums < 64:
+        bsz = 10
+    
+    if image_per_class <= 10:
+        epochs = 2000
+    elif image_per_class <= 50:
+        epochs = 1500
+    elif image_per_class <= 200:
+        epochs = 1000
+
+    # load data
+    traindir = args.save_dir
+    valdir = '/root/share/ImageNet/val'
+    train_transform, test_transform = transform_imagenet(augment=True,
+                                                        from_tensor=False)
+    def is_valid_file(file_path):
+        valid_extensions = ['.jpg', '.jpeg', '.png', '.ppm', '.bmp', '.pgm', '.tif', '.tiff']
+        return any(file_path.endswith(ext) for ext in valid_extensions)
+    
+    train_dataset = ImageFolder(traindir,
+                                train_transform,
+                                nclass=args.nclass,
+                                load_memory=True,
+                                ipc=image_per_class,
+                                spec=args.spec,
+                                is_valid_file=is_valid_file)
+    
+    val_dataset = ImageFolder(valdir,
+                              test_transform,
+                              nclass=args.nclass,
+                              load_memory=True,
+                              spec=args.spec)
+    
+    nclass = len(train_dataset.classes)
+    print("Subclass is extracted: ")
+    print(" #class: ", nclass)
+    print(" #train: ", len(train_dataset.targets))
+    
+    train_loader = MultiEpochsDataLoader(train_dataset,
+                                         batch_size=bsz,
+                                         shuffle=True,
+                                         num_workers=8,
+                                         persistent_workers=True,
+                                         pin_memory=True)
+    
+    val_loader = MultiEpochsDataLoader(val_dataset,
+                                       batch_size=64,
+                                       shuffle=False,
+                                       persistent_workers=True,
+                                       num_workers=4,
+                                       pin_memory=True)
+    
+    # train
+    criterion = nn.CrossEntropyLoss().cuda()
+    args.net_type = args.curriculum_filter
+    print("Initialize a new curriculum filter model")
+    model = define_model(args, args.target_nclass)
+    model.cuda()
+    optimizer = optim.SGD(model.parameters(),
+                          0.01,
+                          momentum=0.9,
+                          weight_decay=5e-4)
+    scheduler = optim.lr_scheduler.MultiStepLR(
+        optimizer, milestones=[2 * epochs // 3, 5 * epochs // 6], gamma=0.2)
+    for epoch in range(epochs):
+        model.train()
+        for i, (input, target) in enumerate(train_loader):
+            input = input.cuda()
+            target = target.cuda()
+            # generate mixed sample
+            lam = np.random.beta(1.0, 1.0)
+            rand_index = random_indices(target, nclass=args.nclass)
+
+            target_b = target[rand_index]
+            bbx1, bby1, bbx2, bby2 = rand_bbox(input.size(), lam)
+            input[:, :, bbx1:bbx2, bby1:bby2] = input[rand_index, :, bbx1:bbx2, bby1:bby2]
+            ratio = 1 - ((bbx2 - bbx1) * (bby2 - bby1) / (input.size()[-1] * input.size()[-2]))
+
+            output = model(input)
+            loss = criterion(output, target) * ratio + criterion(output, target_b) * (1. - ratio)
+            
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+        
+        scheduler.step()
+        if epoch % 100 == 0:
+            print('Epoch %d, Loss: %.4f' % (epoch, loss.item()))
+    
+    # validate the model
+    top1 = AverageMeter()
+    top5 = AverageMeter()
+    for i, (input, target) in enumerate(val_loader):
+        input = input.cuda()
+        target = target.cuda()
+        output = model(input)
+
+        loss = criterion(output, target)
+
+        # measure accuracy and record loss
+        acc1, acc5 = accuracy(output.data, target, topk=(1, 5))
+        top1.update(acc1[0], input.size(0))
+        top5.update(acc5[0], input.size(0))
+    
+    print(f'Validation: Top1:{top1.avg} Top5:{top5.avg}')
+    return model
+
+
 def main(args):
+    # set wandb
+    wandb.init(project='guidance sampling', name='igd', config=args)
+
+
     # Setup PyTorch:
     torch.manual_seed(args.seed)
     # torch.set_grad_enabled(False)
@@ -293,54 +434,95 @@ def main(args):
 
     # define gm resources 
     args.device = 'cuda'
-    surrogate = define_model(args, args.target_nclass).to(args.device)  
+    surrogate = define_model(args, args.target_nclass).to(args.device)
     surrogate = ReparamModule(surrogate)
-    # if args.eval:
     surrogate.eval()
-    # surrogate.train()
     ckpts = rand_ckpts(args)
+    encoder = None
     criterion_ce = nn.CrossEntropyLoss().to(args.device)
-
     
     batch_size = 1
-    for class_label, sel_class in zip(class_labels, sel_classes):
-        os.makedirs(os.path.join(args.save_dir, sel_class), exist_ok=True)
-        print(sel_class)
-        real_gradients, cur_cls, correspond_labels  = get_grads(sel_classes, class_labels, sel_class, ckpts, surrogate)
-        # print('class_label',class_label)
-        # print('cur_cls',cur_cls)
-        assert class_label == cur_cls
-        pseudo_memory_c = []
-        for shift in tqdm(range(args.num_samples // batch_size)):
-            # Create sampling noise:
-            z = torch.randn(batch_size, 4, latent_size, latent_size, device=device)
-            y = torch.tensor([class_label], device=device)
+    if args.num_samples % args.bootstrap_gap == 0:
+        images_per_curriculum = args.bootstrap_gap
+        curriculum_num = args.num_samples // images_per_curriculum
+    else:
+        raise ValueError('num_samples should be divisible by bootstrap_gap')
 
-            # Setup classifier-free guidance:
-            z = torch.cat([z, z], 0)
-            y_null = torch.tensor([1000] * batch_size, device=device)
-            y = torch.cat([y, y_null], 0)
+    for curriculum in range(curriculum_num):
+        # curriculum generation
+        images_in_each_class = []
+        for class_label, sel_class in zip(class_labels, sel_classes):
+            class_path = os.path.join(args.save_dir, sel_class)
+            if not os.path.exists(class_path):
+                os.makedirs(class_path, exist_ok=True)
+            images_in_each_class.append(max(0, len(os.listdir(class_path)) - 1))
+        min_images_in_each_class = min(images_in_each_class)
+        if min_images_in_each_class >= (curriculum + 1) * images_per_curriculum:
+            print("skip curriculum %d"%(curriculum))
+            continue
+        else:
+            print(min_images_in_each_class)
+            if args.ablation == 0:
+                curriculum_filter = train_filter(args, min_images_in_each_class)
+            else:
+                curriculum_filter = None
+            generation_range = range(min_images_in_each_class, (curriculum + 1) * images_per_curriculum)
 
-            gm_resource = [vae, surrogate, ckpts, real_gradients[class_label], correspond_labels[class_label], criterion_ce, args.repeat, args.repeat, args.gm_scale, args.f_scale, encoder]
-            model_kwargs = dict(y=y, cfg_scale=args.cfg_scale, gm_resource=gm_resource, gen_type=args.guide_type, low=args.low, high=args.high, pseudo_memory_c=pseudo_memory_c, neg_e=args.lambda_neg)
+        for class_label, sel_class in zip(class_labels, sel_classes):
+            class_path = os.path.join(args.save_dir, sel_class)
+            if len(os.listdir(class_path)) - 1 >= (curriculum + 1) * images_per_curriculum:
+                print("skip class %s"%(sel_class))
+                continue
 
-            # Sample images:
-            samples = diffusion.p_sample_loop(
-                model.forward_with_cfg, z.shape, z, clip_denoised=False, model_kwargs=model_kwargs, progress=False, device=device)
-            # print('samples',samples.shape)
-            samples, _ = samples.chunk(2, dim=0)  # Remove null class samples
-            # add psuedo samples to the memory
-            pseudo_memory_c.extend(samples.detach().split(1))
-            while len(pseudo_memory_c) > args.memory_size:
-                pseudo_memory_c.pop(0)
-            samples = vae.decode(samples / 0.18215).sample
-            # Save and display images:
-            for image_index, image in enumerate(samples):
-                file_number = image_index + shift * batch_size + args.total_shift
-                save_image(image, os.path.join(args.save_dir, sel_class,
-                                               f"{file_number:04d}.png"), normalize=True, value_range=(-1, 1))
-    
-    print('following is the result of pos_e %s and neg_e %s'%(args.lambda_pos, args.lambda_neg))
+            print(sel_class)
+            # real_gradients, cur_cls, correspond_labels  = get_grads(args, sel_classes, class_labels, sel_class, surrogate=surrogate, ckpts=ckpts)
+            real_gradients, cur_cls, correspond_labels  = get_curriculum_grads(args, sel_classes, class_labels, sel_class, 
+                                                                               surrogate=surrogate, curriculum_filter=curriculum_filter,ckpts=ckpts)
+            assert class_label == cur_cls
+            pseudo_memory_c = []
+            # load all generated images if not empty
+            if curriculum > 0:
+                old_pseudo_memory_c = torch.load(os.path.join(class_path, 'pseudo_memory.pt'))
+                pseudo_memory_c.extend(old_pseudo_memory_c.split(1))
+            for shift in tqdm(generation_range):
+                
+                # Create sampling noise:
+                z = torch.randn(batch_size, 4, latent_size, latent_size, device=device)
+                y = torch.tensor([class_label], device=device)
+
+                # Setup classifier-free guidance:
+                z = torch.cat([z, z], 0)
+                y_null = torch.tensor([1000] * batch_size, device=device)
+                y = torch.cat([y, y_null], 0)
+
+                gm_resource = [vae, surrogate, ckpts, real_gradients[class_label], correspond_labels[class_label], criterion_ce, args.repeat, args.repeat, args.gm_scale, args.f_scale, encoder]
+                model_kwargs = dict(y=y, cfg_scale=args.cfg_scale, gm_resource=gm_resource, gen_type=args.guide_type, low=args.low, high=args.high, pseudo_memory_c=pseudo_memory_c, neg_e=args.lambda_neg)
+
+                # Sample images:
+                samples = diffusion.p_sample_loop(
+                    model.forward_with_cfg, z.shape, z, clip_denoised=False, model_kwargs=model_kwargs, progress=False, device=device)
+                # print('samples',samples.shape)
+                samples, _ = samples.chunk(2, dim=0)  # Remove null class samples
+                # add psuedo samples to the memory
+                if args.guide_type == 'igd':
+                    # latent space'
+                    pseudo_memory_c.extend(samples.detach().split(1))
+                    
+                samples = vae.decode(samples / 0.18215).sample
+                # Save and display images:
+                while len(pseudo_memory_c) > args.memory_size:
+                        pseudo_memory_c.pop(0)
+
+                for image_index, image in enumerate(samples):
+                    file_number = image_index + shift * batch_size + args.total_shift
+                    save_image(image, os.path.join(args.save_dir, sel_class,
+                                                f"{file_number:04d}.png"), normalize=True, value_range=(-1, 1))
+            # save the pseudo memory
+            pseudo_memory_c = torch.cat(pseudo_memory_c, 0)
+            torch.save(pseudo_memory_c, os.path.join(class_path, 'pseudo_memory.pt'))
+        
+        print('following is the result of pos_e %s and neg_e %s'%(args.lambda_pos, args.lambda_neg))
+        
 
 
 if __name__ == "__main__":
@@ -362,7 +544,7 @@ if __name__ == "__main__":
     parser.add_argument("--target_nclass", type=int, default=1000, help='the class number for generation')
     parser.add_argument("--depth", type=int, default=10, help='the network depth')
     parser.add_argument("--phase", type=int, default=0, help='the phase number for generating large datasets')
-    parser.add_argument("--memory-size", type=int, default=64, help='the memory size')
+    parser.add_argument("--memory-size", type=int, default=100, help='the memory size')
     parser.add_argument("--real_ipc", type=int, default=1000, help='the number of samples participating in the fine-tuning')
     parser.add_argument("--grad-ipc", type=int, default=80, help='the number of samples participating in the fine-tuning')
     parser.add_argument('--lambda-pos', default=0.03, type=float, help='weight for representativeness constraint')
@@ -370,10 +552,19 @@ if __name__ == "__main__":
     parser.add_argument("--data-path", type=str, required=True)
     parser.add_argument("--net-type", type=str, default='convnet6')
     parser.add_argument("--gm-scale", type=float, default=0.02)
+    parser.add_argument("--f-scale", type=float, default=0.02)
+    parser.add_argument("--feat-extractor", type=str, default='dinov2')
     parser.add_argument("--low", type=int, default=500, help='allowed lowest time step for gm guidance')
     parser.add_argument("--high", type=int, default=800, help='allowed highest time step for gm guidance')
     parser.add_argument("--ckpt_path", type=str, required=True)
     parser.add_argument("--repeat", type=int, required=True, help='repeat for the GM recursive during low-high sampling steps')
+    parser.add_argument("--guide_type", type=str, default='igd', help='the guidance type for the generation')
+    # parser.add_argument("--schedule_gap", type=int, default=200, help='the gap for the curriculum schedule')
+
+    parser.add_argument("--curriculum_filter", type=str, default='convnet6', help='the guidance type for the generation')
+    parser.add_argument("--bootstrap_gap", type=int, default=4, help='the number of curriculums')
+    parser.add_argument("--ablation", type=int, default=0)
+
     args = parser.parse_args()
     print('args\n',args)
     main(args)
