@@ -300,6 +300,7 @@ def main(args):
     # surrogate.train()
     ckpts = rand_ckpts(args)
     criterion_ce = nn.CrossEntropyLoss().to(args.device)
+    encoder = None
 
     
     batch_size = 1

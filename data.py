@@ -80,6 +80,7 @@ class ImageFolder(datasets.DatasetFolder):
                                                                    seed=seed)
         else:
             self.classes, self.class_to_idx = self.find_classes(self.root)
+        self.idx_to_class = {v: k for k, v in self.class_to_idx.items()}
         self.original_labels = self.find_original_classes()
         self.nclass = nclass
         self.samples = datasets.folder.make_dataset(self.root, self.class_to_idx, self.extensions,
@@ -285,7 +286,7 @@ class ImageFolder_mp(datasets.DatasetFolder):
         class_to_idx = {key: value for key, value in class_to_idx.items() if key == sel_class}
         # print('cls_from',cls_from)
         # print('cls_to',cls_to)
-        print('class_to_idx',class_to_idx)
+        print('class_to_idx', class_to_idx)
         # assert len(classes) == nclass
 
         return classes, class_to_idx
